@@ -1,0 +1,94 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root,
+:root[data-theme="dark"] {
+  --ink: 5 11 26;
+  --panel: 16 28 56;
+  --fg: 226 236 255;
+  --dim: 134 154 194;
+  --cyan: 34 211 238;
+  --azure: 59 130 246;
+  --violet: 139 92 246;
+  --danger: 251 113 133;
+  --line: 140 175 255;
+  --glow-a: 34 211 238;
+  --glow-b: 139 92 246;
+  color-scheme: dark;
+}
+:root[data-theme="light"] {
+  --ink: 238 243 252;
+  --panel: 255 255 255;
+  --fg: 12 20 40;
+  --dim: 78 94 130;
+  --cyan: 8 133 168;
+  --azure: 37 99 235;
+  --violet: 109 40 217;
+  --danger: 190 18 60;
+  --line: 40 70 140;
+  --glow-a: 56 189 248;
+  --glow-b: 167 139 250;
+  color-scheme: light;
+}
+
+html, body, #root { height: 100%; }
+body {
+  margin: 0;
+  font-family: "Sora", system-ui, sans-serif;
+  color: rgb(var(--fg));
+  background-color: rgb(var(--ink));
+  background-image:
+    radial-gradient(60rem 40rem at 85% -10%, rgb(var(--glow-b) / 0.18), transparent 60%),
+    radial-gradient(50rem 36rem at -10% 110%, rgb(var(--glow-a) / 0.14), transparent 60%),
+    linear-gradient(rgb(var(--line) / 0.045) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(var(--line) / 0.045) 1px, transparent 1px);
+  background-size: auto, auto, 44px 44px, 44px 44px;
+  background-attachment: fixed;
+  -webkit-font-smoothing: antialiased;
+}
+
+:focus-visible { outline: 2px solid rgb(var(--cyan)); outline-offset: 2px; }
+
+@layer components {
+  .glass {
+    background: rgb(var(--panel) / 0.55);
+    backdrop-filter: blur(18px) saturate(140%);
+    -webkit-backdrop-filter: blur(18px) saturate(140%);
+    border: 1px solid rgb(var(--line) / 0.16);
+    box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.06), 0 12px 40px -18px rgb(0 0 0 / 0.55);
+  }
+  .num { font-family: "JetBrains Mono", ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+  .field {
+    width: 100%;
+    border-radius: 0.75rem;
+    border: 1px solid rgb(var(--line) / 0.22);
+    background: rgb(var(--ink) / 0.55);
+    padding: 0.65rem 0.85rem;
+    color: rgb(var(--fg));
+  }
+  .field::placeholder { color: rgb(var(--dim) / 0.8); }
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 0.5rem;
+    border-radius: 0.75rem; padding: 0.65rem 1.1rem; font-weight: 500;
+    transition: background-color .15s, border-color .15s, opacity .15s;
+  }
+  .btn:disabled { opacity: 0.55; cursor: not-allowed; }
+  .btn-primary {
+    color: rgb(5 11 26);
+    background: linear-gradient(135deg, rgb(var(--cyan)), rgb(var(--azure)));
+  }
+  .btn-primary:hover:not(:disabled) { filter: brightness(1.08); }
+  .btn-ghost { border: 1px solid rgb(var(--line) / 0.22); color: rgb(var(--fg)); }
+  .btn-ghost:hover:not(:disabled) { background: rgb(var(--line) / 0.1); }
+}
+
+/* The vortex on the sign-in screen is the one decorative moment in the app. */
+@keyframes xv-spin { to { transform: rotate(360deg); } }
+.vortex-ring { transform-origin: 50% 50%; animation: xv-spin var(--dur, 40s) linear infinite; }
+.vortex-ring.reverse { animation-direction: reverse; }
+
+@media (prefers-reduced-motion: reduce) {
+  .vortex-ring { animation: none; }
+  * { scroll-behavior: auto !important; transition-duration: 0.01ms !important; }
+}
