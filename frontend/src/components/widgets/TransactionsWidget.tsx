@@ -16,7 +16,7 @@ export function TransactionsWidget({ data }: { data: DashboardSummary }) {
                   {t.label}
                   {t.simulated && <span className="ml-2 rounded-full border border-violet/40 px-1.5 py-0.5 text-xs text-violet">Simulated</span>}
                 </p>
-                <p className="text-xs text-dim">{formatDate(t.occurred_at)}</p>
+                <p className="text-xs text-dim">{formatDate(t.occurred_at, t.kind === "loan_payment" ? "UTC" : undefined)}</p>
               </div>
               <span className="num shrink-0">{formatMoney(t.amount, t.currency)}</span>
             </li>

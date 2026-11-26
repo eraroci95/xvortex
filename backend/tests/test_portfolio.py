@@ -36,3 +36,14 @@ def test_loan_without_schedule_falls_back_to_principal_minus_payments():
     snap = LoanSnapshot(object(), "SEK", D("1000"), [], [D("300"), D("900")])
     (t,) = summarize_loans([snap], TODAY)
     assert t.outstanding_principal == D("0.00") and t.overdue_loans == 0
+
+
+def test_overpayment_is_reported_not_dropped():
+    over = _loan(paid=["99999"])  # far more than the schedule asks for
+    no_schedule = LoanSnapshot(object(), "SEK", D("1000"), [], [D("1300")])
+    (t,) = summarize_loans([over, no_schedule], TODAY)
+    exact_total = sum(i.total for i in over.schedule)
+    assert t.outstanding_principal == D("0.00") and t.overdue_loans == 0
+    assert t.unapplied_payments == (D("99999") - exact_total + D("300")).quantize(D("0.01"))
+    (clean,) = summarize_loans([_loan()], TODAY)
+    assert clean.unapplied_payments == D("0.00")

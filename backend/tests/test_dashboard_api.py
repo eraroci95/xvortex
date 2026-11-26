@@ -57,8 +57,33 @@ def test_summary_uses_real_loan_rows(client):
     sek = body["loans"][0]
     assert sek["currency"] == "SEK" and sek["active_loans"] == 1 and sek["overdue_loans"] == 0
     assert sek["total_lent"] == "1200.00" and sek["outstanding_principal"] == "1112.00"
+    assert sek["unapplied_payments"] == "0.00"
     assert body["paper"]["cash"] == "1000.00"
     assert body["transactions"][0]["label"] == "Payment from Test Borrower"
+
+
+def test_summary_never_includes_another_users_rows(client):
+    with client.Session() as s:
+        other = s.scalar(select(User.id).where(User.email == "user@example.com"))
+        b = Borrower(user_id=other, name="Other Borrower")
+        s.add(b)
+        s.flush()
+        loan = Loan(
+            user_id=other, borrower_id=b.id, principal=D("5000.00"), annual_interest_rate=D("5"),
+            currency="USD", start_date=date(2025, 1, 1), maturity_date=date(2027, 1, 1),
+            repayment_frequency="monthly", amortization_method="annuity",
+        )
+        s.add(loan)
+        s.flush()
+        s.add(LoanPayment(loan_id=loan.id, paid_on=date(2025, 2, 1), amount=D("100.00")))
+        s.add(PaperAccount(user_id=other, name="Theirs", starting_cash=D("777"), cash_balance=D("777")))
+        s.add(Notification(user_id=other, kind="loan", title="Theirs"))
+        s.commit()
+    login(client)  # the admin owns none of the rows above
+    body = client.get("/api/dashboard/summary").json()
+    assert body["loans"] == [] and body["transactions"] == []
+    assert body["paper"]["accounts"] == 0 and body["paper"]["cash"] == "0.00"
+    assert body["notifications"] == {"unread": 0, "latest": []}
 
 
 def test_layout_defaults_roundtrip_and_validation(client):

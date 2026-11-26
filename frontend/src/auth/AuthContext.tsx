@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
-import { api, ApiError, setCsrfToken } from "../lib/api";
+import { api, ApiError, setCsrfToken, setUnauthorizedHandler } from "../lib/api";
 
 export interface User {
   id: string;
@@ -22,6 +22,11 @@ const AuthContext = createContext<AuthState | null>(null);
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    setUnauthorizedHandler(() => { setCsrfToken(null); setUser(null); });
+    return () => setUnauthorizedHandler(null);
+  }, []);
 
   useEffect(() => {
     api<SessionResponse>("/api/auth/me")

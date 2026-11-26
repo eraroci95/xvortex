@@ -27,11 +27,13 @@ class CurrencyTotals:
     outstanding_principal: Decimal = ZERO
     remaining_interest: Decimal = ZERO
     overdue_amount: Decimal = ZERO
+    unapplied_payments: Decimal = ZERO  # paid beyond everything the schedule asks for
     loan_ids: list = field(default_factory=list)
 
 
 def summarize_loans(loans: list[LoanSnapshot], today: date) -> list[CurrencyTotals]:
-    """A loan with no stored schedule falls back to principal minus payments (never below zero)."""
+    """A loan with no stored schedule falls back to principal minus payments (never below zero).
+    Payments beyond what a loan owes are reported as `unapplied_payments`, not silently dropped."""
     by_currency: dict[str, CurrencyTotals] = {}
     for loan in loans:
         t = by_currency.setdefault(loan.currency, CurrencyTotals(loan.currency))
@@ -39,9 +41,12 @@ def summarize_loans(loans: list[LoanSnapshot], today: date) -> list[CurrencyTota
         t.total_lent += loan.principal
         t.loan_ids.append(loan.loan_id)
         if not loan.schedule:
-            t.outstanding_principal += max(loan.principal - sum(loan.payments, ZERO), ZERO)
+            paid = sum(loan.payments, ZERO)
+            t.outstanding_principal += max(loan.principal - paid, ZERO)
+            t.unapplied_payments += max(paid - loan.principal, ZERO)
             continue
-        allocations, _excess = allocate_payments(loan.schedule, loan.payments)
+        allocations, excess = allocate_payments(loan.schedule, loan.payments)
+        t.unapplied_payments += excess
         t.outstanding_principal += outstanding_principal(allocations)
         t.remaining_interest += remaining_interest(allocations)
         overdue = overdue_installments(allocations, today)
@@ -49,6 +54,6 @@ def summarize_loans(loans: list[LoanSnapshot], today: date) -> list[CurrencyTota
             t.overdue_loans += 1
             t.overdue_amount += sum((a.principal_outstanding + a.interest_outstanding for a, _ in overdue), ZERO)
     for t in by_currency.values():
-        for name in ("total_lent", "outstanding_principal", "remaining_interest", "overdue_amount"):
+        for name in ("total_lent", "outstanding_principal", "remaining_interest", "overdue_amount", "unapplied_payments"):
             setattr(t, name, money(getattr(t, name)))
     return sorted(by_currency.values(), key=lambda t: t.currency)

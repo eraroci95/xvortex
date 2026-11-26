@@ -1,7 +1,7 @@
 import { Link } from "react-router-dom";
 import { formatMoney } from "../../lib/format";
 import type { DashboardSummary } from "../../lib/types";
-import { Empty, Row, WidgetFrame } from "./WidgetFrame";
+import { Empty, Row, Unavailable, WidgetFrame } from "./WidgetFrame";
 
 export function LoansWidget({ data }: { data: DashboardSummary }) {
   const { loans } = data;
@@ -23,9 +23,16 @@ export function LoansWidget({ data }: { data: DashboardSummary }) {
                 {t.overdue_loans > 0 && (
                   <Row label="Amount overdue" value={formatMoney(t.overdue_amount, t.currency)} tone="danger" />
                 )}
+                {Number(t.unapplied_payments) > 0 && (
+                  <Row label="Paid beyond schedule" value={formatMoney(t.unapplied_payments, t.currency)} />
+                )}
               </dl>
             </div>
           ))}
+          <Unavailable>
+            Remaining interest follows each loan's original schedule. Early repayments reduce principal
+            but do not recalculate the interest still to come.
+          </Unavailable>
         </div>
       )}
     </WidgetFrame>

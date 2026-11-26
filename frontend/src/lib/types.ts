@@ -10,6 +10,7 @@ export interface LoanTotals {
   outstanding_principal: string;
   remaining_interest: string;
   overdue_amount: string;
+  unapplied_payments: string;
 }
 
 export interface PaperSummary {

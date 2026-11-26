@@ -1,8 +1,11 @@
 from datetime import date
 from decimal import Decimal as D
 
+import pytest
+
 from app.services.loans.amortization import (
-    allocate_payments, add_months, build_schedule, due_dates, outstanding_principal, remaining_interest,
+    MAX_INSTALLMENTS, allocate_payments, add_months, build_schedule, due_dates, final_period_fraction,
+    outstanding_principal, remaining_interest,
 )
 
 
@@ -64,3 +67,33 @@ def test_allocation_partial_and_overpayment():
     assert remaining_interest(allocs) == total_interest - D("12.00")
     allocs, excess = allocate_payments(s, [D("999999")])
     assert outstanding_principal(allocs) == 0 and excess > 0
+
+
+def test_short_final_period_charges_prorated_interest_not_a_full_period():
+    # Regular dates run to May 31; maturity is Jun 1, one day into a 30-day period (May 31 to Jun 30).
+    s = build_schedule(D("10000"), D("12"), date(2026, 1, 31), date(2026, 6, 1), "monthly", "annuity")
+    assert [i.due_date for i in s][-2:] == [date(2026, 5, 31), date(2026, 6, 1)]
+    assert s[-2].interest == D("40.60") and s[-1].interest == D("0.68")  # 2040.00 * 1% / 30 days
+    assert sum(i.principal for i in s) == D("10000.00")
+
+
+def test_schedule_ending_on_a_regular_date_is_unchanged():
+    dates = due_dates(date(2026, 1, 1), date(2026, 7, 1), "monthly")
+    assert final_period_fraction(date(2026, 1, 1), "monthly", dates) == 1
+    s = build_schedule(D("1200"), D("12"), date(2026, 1, 1), date(2026, 7, 1), "monthly", "equal_principal")
+    assert s[-1].interest == D("2.00")  # a full month on the last 200.00
+
+
+def test_loan_shorter_than_one_period_is_prorated_too():
+    s = build_schedule(D("1000"), D("12"), date(2026, 1, 1), date(2026, 1, 11), "monthly", "interest_only")
+    assert len(s) == 1 and s[0].principal == D("1000.00")
+    assert s[0].interest == D("3.23")  # 1000 * 1% * 10/31
+
+
+def test_installment_count_is_capped():
+    assert len(due_dates(date(2026, 1, 1), date(2126, 1, 1), "monthly")) == MAX_INSTALLMENTS
+    for end in (date(2126, 2, 1), date(9999, 1, 1)):
+        with pytest.raises(ValueError, match="more than"):
+            due_dates(date(2026, 1, 1), end, "monthly")
+    with pytest.raises(ValueError, match="more than"):
+        build_schedule(D("1000"), D("5"), date(2026, 1, 1), date(2100, 1, 1), "weekly", "annuity")

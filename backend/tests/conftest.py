@@ -2,6 +2,7 @@ import os
 
 os.environ.setdefault("DATABASE_URL", "sqlite+pysqlite:///:memory:")
 os.environ.setdefault("SECRET_KEY", "test-secret")
+os.environ.setdefault("ENVIRONMENT", "development")  # the setting defaults to production (Secure cookies)
 
 import pytest  # noqa: E402
 

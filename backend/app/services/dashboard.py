@@ -139,7 +139,7 @@ def build_summary(db: Session, user: User, today: date | None = None) -> dict[st
         "loans": [
             {k: getattr(t, k) for k in (
                 "currency", "active_loans", "overdue_loans", "total_lent",
-                "outstanding_principal", "remaining_interest", "overdue_amount")}
+                "outstanding_principal", "remaining_interest", "overdue_amount", "unapplied_payments")}
             for t in totals
         ],
         "paper": _paper(db, user.id, currency),

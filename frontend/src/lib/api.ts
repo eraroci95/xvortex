@@ -3,6 +3,13 @@ const BASE = import.meta.env.VITE_API_URL ?? "";
 let csrfToken: string | null = null;
 export const setCsrfToken = (t: string | null) => { csrfToken = t; };
 
+// Called when a request that needs a session comes back 401 (the session expired or was revoked),
+// so the app can drop its signed-in state and send the user to the sign-in page.
+let onUnauthorized: (() => void) | null = null;
+export const setUnauthorizedHandler = (fn: (() => void) | null) => { onUnauthorized = fn; };
+// 401 here means a wrong password or "no session yet", not an expired session.
+const SESSION_PROBES = new Set(["/api/auth/login", "/api/auth/me"]);
+
 export class ApiError extends Error {
   status: number;
   constructor(status: number, message: string) {
@@ -39,6 +46,7 @@ export async function api<T>(path: string, options: { method?: string; body?: un
   } catch {
     throw new ApiError(0, "Cannot reach the server. Check your connection and try again.");
   }
+  if (res.status === 401 && !SESSION_PROBES.has(path)) onUnauthorized?.();
   if (res.status === 204) return undefined as T;
   const body = await res.json().catch(() => null);
   if (!res.ok) throw new ApiError(res.status, describeError(body, `Request failed (${res.status}).`));

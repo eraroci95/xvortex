@@ -2,6 +2,10 @@
 
 These are descriptive flags derived from payment history, not a prediction of default.
 Every flag lists the rule that triggered it so the user can see exactly why.
+
+An installment that is only a few days late is not flagged (the overdue_days_medium grace period);
+the dashboard still counts it as overdue. Portfolio figures passed in must be in the same currency
+as the loan being assessed: amounts in different currencies are never added together.
 """
 from dataclasses import dataclass, field
 from datetime import date
@@ -17,11 +21,12 @@ DISCLAIMER = (
 
 @dataclass(frozen=True)
 class RiskRules:
-    overdue_days_medium: int = 7
+    overdue_days_medium: int = 7  # grace period: a shorter delay is not flagged
     overdue_days_high: int = 30
-    missed_medium: int = 1
+    missed_medium: int = 2
     missed_high: int = 3
     exposure_share_high: Decimal = Decimal("0.40")  # share of total portfolio outstanding
+    exposure_min_loans: int = 3  # with fewer loans, any one of them is a large share by construction
 
 
 @dataclass
@@ -44,6 +49,7 @@ def assess_loan(
     today: date,
     outstanding: Decimal,
     portfolio_outstanding: Decimal,
+    portfolio_loans: int,
     rules: RiskRules = RiskRules(),
 ) -> RiskAssessment:
     overdue = overdue_installments(allocations, today)
@@ -64,9 +70,13 @@ def assess_loan(
         raise_to("medium", f"An installment is {max_days} days overdue (medium threshold {rules.overdue_days_medium}).")
     if missed >= rules.missed_high:
         raise_to("high", f"{missed} installments are unpaid past due (high threshold {rules.missed_high}).")
-    elif missed >= rules.missed_medium and max_days >= 1:
-        raise_to("medium", f"{missed} installment(s) are unpaid past due.")
-    if portfolio_outstanding > 0 and outstanding / portfolio_outstanding >= rules.exposure_share_high:
+    elif missed >= rules.missed_medium:
+        raise_to("medium", f"{missed} installments are unpaid past due (medium threshold {rules.missed_medium}).")
+    if (
+        portfolio_loans >= rules.exposure_min_loans
+        and portfolio_outstanding > 0
+        and outstanding / portfolio_outstanding >= rules.exposure_share_high
+    ):
         share = (outstanding / portfolio_outstanding * 100).quantize(Decimal("0.1"))
         raise_to("medium", f"This loan is {share}% of total outstanding principal.")
     return RiskAssessment(level, triggers)

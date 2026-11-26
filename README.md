@@ -10,7 +10,7 @@ phases 4 to 8; until then their pages say so and show no sample data.
 
 ```
 backend/            FastAPI app, SQLAlchemy models, Alembic migrations, tests
-  app/api/          routers (auth, admin), dependencies (session, CSRF, admin checks)
+  app/api/          routers (auth, admin, dashboard, settings, notifications), dependencies (session, CSRF, admin checks)
   app/core/         settings, Argon2 helpers, rate limiter, JSON logging
   app/models/       one module per domain
   app/services/     business logic (loan calculations, audit, admin bootstrap)
@@ -24,13 +24,32 @@ render.yaml         Render Blueprint (API + static frontend)
 ## Security model (phase 2)
 
 - No public registration: an administrator creates accounts (Users page, or `ADMIN_EMAIL`/`ADMIN_PASSWORD` for the first one).
+- Passwords: anyone can change their own from Account (needs the current password, is rate limited, and replaces every
+  session including the current one, so a copied cookie stops working). An administrator can reset another user's
+  password from the Users page (optionally generated in the browser); that signs the user out everywhere and lifts a
+  sign-in lockout on the account. Both are audited. Admins cannot reset their own password that way.
+- Locked out as the only administrator? From `backend/` with `DATABASE_URL` set to your Neon connection string, run
+  `python -m app.cli reset-password you@example.com` (add `--activate` if the account was deactivated). It prompts for
+  the new password, signs the account out everywhere and writes an audit row. It runs on your machine, not over HTTP.
 - Passwords are hashed with Argon2id; minimum 12 characters.
 - Login creates a server-side session. The browser only holds a random token in an `HttpOnly`, `Secure`
   (production), `SameSite=Lax` cookie; the database stores only its SHA-256 hash. Sessions expire after
   `SESSION_TTL_MINUTES` (default 12 hours).
 - State-changing requests need the `X-CSRF-Token` header that matches the session.
-- Login is rate limited per IP (20 attempts / 5 min) and per account (5 failures / 15 min). The limiter is
-  in memory, which is fine for one Render instance; use a shared store before scaling out.
+- Login is rate limited per IP (20 attempts / 5 min) and per account (5 failures / 15 min). Each attempt is
+  counted before the password is checked, so parallel requests cannot slip past the limit; a successful
+  sign-in clears the account's count. The limiter is in memory, which is fine for one Render instance; use a
+  shared store before scaling out. Trade-off: anyone who knows an email can lock that account for up to
+  15 minutes by failing five times.
+- Argon2 uses about 64 MiB per hash, and a Render instance has 512 MB. `PASSWORD_HASH_CONCURRENCY` (default 2)
+  caps how many hashes run at once; further logins wait their turn instead of exhausting memory.
+- Client IPs (audit log, per-IP limit) come from `X-Forwarded-For`, but Render appends to whatever the client
+  sent, so only entries written by trusted proxies are believed: `TRUSTED_PROXY_HOPS` entries counted from the
+  right (default 1). After the first deploy, sign in and check `select ip from audit_logs where action = 'login'
+  order by id desc limit 1;` against your own public IP. If it shows a Render or Cloudflare address, set
+  `TRUSTED_PROXY_HOPS=2`. If the header is missing or malformed, the socket address is used.
+- `ENVIRONMENT` must be `development` or `production`. It defaults to production, so a missing variable turns
+  protections on (Secure cookie, API docs off) instead of off.
 - Unknown email and wrong password return the same message and take similar time.
 - Logins, failures, logouts and user changes are written to `audit_logs`.
 - Every private route is attached via `PRIVATE` in `app/api/deps.py`; admin routes add `require_admin`.
@@ -53,7 +72,9 @@ npm install
 npm run dev                  # http://localhost:5173, /api is proxied to localhost:8000
 ```
 
-Commit `frontend/package-lock.json` after the first `npm install`.
+Commit `frontend/package-lock.json` after the first `npm install`. CI and Render use `npm ci` once it exists
+(and `npm install` until then). CI runs the backend tests, applies the Alembic migration to a real Postgres
+(including `alembic check` against the models and a rollback), and type-checks and builds the frontend.
 
 ## Deploy: GitHub, Neon, Render
 
@@ -83,6 +104,8 @@ cookie work between the app and the API.
   interest come from the stored repayment schedule and recorded payments (oldest installment first, interest before principal).
 - Paper trading shows cash, invested amount at cost and realized profit/loss. Market value and unrealized
   profit/loss are reported as unavailable until a price source exists (phase 5); they are never estimated.
+- Payments beyond what a loan owes are shown as "Paid beyond schedule" instead of being dropped. Remaining
+  interest follows the original schedule and is not recalculated after early repayments; the widget says so.
 - Market watch and news show an explicit "not connected" note instead of placeholder quotes or headlines.
 - Widget order and visibility are saved per user via `PUT /api/settings/dashboard-layout`.
 - The bell in the top bar reads `GET /api/notifications` (each user sees only their own).
@@ -91,7 +114,10 @@ cookie work between the app and the API.
 
 - Money, prices and quantities are `NUMERIC`/`Decimal`, never floats.
 - Paper-trading rows carry `is_simulated`, enforced `TRUE` by a database check constraint.
-- Loan rules are documented in `backend/app/services/loans/amortization.py`; risk flags are rule-based, not predictions.
+- Loan rules are documented in `backend/app/services/loans/amortization.py`; risk flags are rule-based, not
+  predictions. A final period shorter than a full one pays prorated interest, and a schedule is capped at
+  1200 installments. Installments less than a week late are not flagged, and the concentration flag needs at
+  least three loans.
 - Theme (dark or light) is stored in the browser for now; per-user settings sync arrives with the settings API.
 
 ## Roadmap

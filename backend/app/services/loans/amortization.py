@@ -9,6 +9,10 @@ Documented conventions (configurable per loan via `method` and `frequency`):
     equal_principal  equal principal installments (total shrinks over time)
     interest_only    interest each period, full principal at maturity
 - Due dates are start_date + k periods; the last installment is always on maturity_date.
+  When maturity falls before the next regular date, the last installment covers a short period and
+  its interest is prorated by days (actual days / days in the full period) instead of charging a
+  whole period.
+- A schedule may have at most MAX_INSTALLMENTS installments.
 - Payments are allocated to the oldest unpaid installment first, interest before principal.
 - Prepayments do not recompute the schedule in this version; they reduce the remaining
   principal due on the oldest installments.
@@ -19,6 +23,8 @@ from datetime import date, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 
 CENT = Decimal("0.01")
+ONE = Decimal(1)
+MAX_INSTALLMENTS = 1200  # 100 years of monthly installments; stops absurd inputs creating huge schedules
 PERIODS_PER_YEAR = {
     "weekly": 52, "biweekly": 26, "monthly": 12, "quarterly": 4, "semiannual": 2, "annual": 1,
 }
@@ -83,10 +89,23 @@ def due_dates(start: date, maturity: date, frequency: str) -> list[date]:
         raise ValueError("maturity must be after start")
     dates, k = [], 1
     while (d := due_date(start, frequency, k)) < maturity:
+        if len(dates) + 2 > MAX_INSTALLMENTS:  # this date plus the final one on maturity
+            raise ValueError(f"schedule would have more than {MAX_INSTALLMENTS} installments")
         dates.append(d)
         k += 1
     dates.append(maturity)
     return dates
+
+
+def final_period_fraction(start: date, frequency: str, dates: list[date]) -> Decimal:
+    """Share of a full period covered by the last installment: 1 when maturity is a regular due date,
+    less when it falls earlier (a short final period)."""
+    n = len(dates)
+    previous = dates[-2] if n > 1 else start
+    regular_end = due_date(start, frequency, n)
+    if dates[-1] >= regular_end:
+        return ONE
+    return Decimal((dates[-1] - previous).days) / Decimal((regular_end - previous).days)
 
 
 def build_schedule(
@@ -107,6 +126,7 @@ def build_schedule(
     dates = due_dates(start, maturity, frequency)
     n = len(dates)
     r = annual_rate_percent / Decimal(100) / PERIODS_PER_YEAR[frequency]
+    r_last = r * final_period_fraction(start, frequency, dates)
 
     if method == "annuity":
         level = principal / n if r == 0 else principal * r / (1 - (1 + r) ** -n)
@@ -116,8 +136,8 @@ def build_schedule(
 
     balance, out = principal, []
     for i, d in enumerate(dates, start=1):
-        interest = money(balance * r)
         last = i == n
+        interest = money(balance * (r_last if last else r))
         if method == "interest_only":
             princ = balance if last else Decimal("0.00")
         elif last:

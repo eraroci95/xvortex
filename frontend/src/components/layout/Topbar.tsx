@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Bell, LogOut, Menu, Moon, Search, Sun } from "lucide-react";
+import { Bell, KeyRound, LogOut, Menu, Moon, Search, Sun } from "lucide-react";
 import { useAuth } from "../../auth/AuthContext";
 import { useTheme } from "../../theme/ThemeContext";
-import { api } from "../../lib/api";
+import { api, ApiError } from "../../lib/api";
 import { formatDateTime } from "../../lib/format";
 import type { AppNotification } from "../../lib/types";
 import { useApi } from "../../lib/useApi";
@@ -31,15 +31,28 @@ export function Topbar({ onOpenMenu }: { onOpenMenu: () => void }) {
   const bell = usePopover();
   const notes = useApi<{ unread: number; items: AppNotification[] }>("/api/notifications?limit=10");
   const unread = notes.data?.unread ?? 0;
+  const [markError, setMarkError] = useState<string | null>(null);
+
+  // Keep the unread dot current without a page reload. Reloading also notices an expired session.
+  const reloadNotes = notes.reload;
+  useEffect(() => {
+    const id = window.setInterval(reloadNotes, 60000);
+    return () => window.clearInterval(id);
+  }, [reloadNotes]);
 
   function toggleBell() {
-    if (!bell.open) notes.reload();
+    if (!bell.open) reloadNotes();
     bell.setOpen(!bell.open);
   }
 
   async function markAllRead() {
-    await api("/api/notifications/read-all", { method: "POST" });
-    notes.reload();
+    setMarkError(null);
+    try {
+      await api("/api/notifications/read-all", { method: "POST" });
+      reloadNotes();
+    } catch (err) {
+      setMarkError(err instanceof ApiError ? err.message : "Could not mark notifications as read.");
+    }
   }
   const profile = usePopover();
 
@@ -94,7 +107,7 @@ export function Topbar({ onOpenMenu }: { onOpenMenu: () => void }) {
                   <button className="text-xs text-cyan hover:underline" onClick={() => void markAllRead()}>Mark all read</button>
                 )}
               </div>
-              {notes.error && <p className="mt-2 text-danger">{notes.error}</p>}
+              {(markError ?? notes.error) && <p className="mt-2 text-danger">{markError ?? notes.error}</p>}
               {!notes.error && (notes.data?.items.length ?? 0) === 0 && (
                 <p className="mt-2 text-dim">You're all caught up. Alerts about overdue loans and other changes will show here.</p>
               )}
@@ -124,6 +137,10 @@ export function Topbar({ onOpenMenu }: { onOpenMenu: () => void }) {
                 <p className="font-medium">{user?.display_name}</p>
                 <p className="truncate text-dim">{user?.email}</p>
               </div>
+              <button className="flex w-full items-center gap-2 rounded-lg px-3 py-2 hover:bg-white/10"
+                onClick={() => { profile.setOpen(false); navigate("/account"); }}>
+                <KeyRound className="h-4 w-4" aria-hidden />Account and password
+              </button>
               <button className="flex w-full items-center gap-2 rounded-lg px-3 py-2 hover:bg-white/10" onClick={() => void logout()}>
                 <LogOut className="h-4 w-4" aria-hidden />Sign out
               </button>

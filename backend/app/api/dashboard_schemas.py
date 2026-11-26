@@ -13,6 +13,7 @@ class LoanTotalsOut(BaseModel):
     outstanding_principal: Decimal
     remaining_interest: Decimal
     overdue_amount: Decimal
+    unapplied_payments: Decimal
 
 
 class PaperSummaryOut(BaseModel):

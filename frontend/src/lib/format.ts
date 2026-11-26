@@ -12,8 +12,10 @@ export function formatDateTime(iso: string): string {
   return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(iso));
 }
 
-export function formatDate(iso: string): string {
-  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(new Date(iso));
+// Pass timeZone "UTC" for a calendar date the API sends as midnight UTC, so it does not shift a day
+// for viewers west of Greenwich.
+export function formatDate(iso: string, timeZone?: string): string {
+  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeZone }).format(new Date(iso));
 }
 
 export const isNegative = (value: string): boolean => Number(value) < 0;

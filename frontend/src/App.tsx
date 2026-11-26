@@ -3,6 +3,7 @@ import { BrowserRouter, Navigate, Outlet, Route, Routes, useLocation } from "rea
 import { AuthProvider, useAuth } from "./auth/AuthContext";
 import { AppShell } from "./components/layout/AppShell";
 import { ThemeProvider } from "./theme/ThemeContext";
+import Account from "./pages/Account";
 import Admin from "./pages/Admin";
 import CommandCenter from "./pages/CommandCenter";
 import ComingSoon from "./pages/ComingSoon";
@@ -42,6 +43,7 @@ export default function App() {
                 <Route path="paper" element={<ComingSoon title="Paper Trading" phase={6}>Simulated orders and positions will live here. No real orders are ever placed.</ComingSoon>} />
                 <Route path="analytics" element={<ComingSoon title="Analytics" phase={7}>Loan, portfolio and cash-flow reports with CSV and PDF export will be here.</ComingSoon>} />
                 <Route path="assistant" element={<ComingSoon title="Assistant" phase={8}>An optional assistant that explains your data. It only sees your data if you allow it.</ComingSoon>} />
+                <Route path="account" element={<Account />} />
                 <Route element={<RequireAdmin />}>
                   <Route path="admin" element={<Admin />} />
                 </Route>

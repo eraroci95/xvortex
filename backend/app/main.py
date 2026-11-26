@@ -64,8 +64,10 @@ app.include_router(notifications.router)
 
 
 @app.get("/healthz", include_in_schema=False)
-def healthz() -> dict[str, str]:
-    """Liveness: the process is up. Used by Render's health check."""
+async def healthz() -> dict[str, str]:
+    """Liveness: the process is up. Used by Render's health check.
+    Async on purpose: it runs on the event loop, so it still answers when every worker thread
+    is busy (for example queued behind password hashing)."""
     return {"status": "ok"}
 
 

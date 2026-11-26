@@ -6,11 +6,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.deps import PRIVATE, client_ip, require_admin
-from app.api.schemas import UserActive, UserCreate, UserOut
+from app.api.auth import email_limiter
+from app.api.schemas import PasswordReset, UserActive, UserCreate, UserOut
 from app.core.security import hash_password
 from app.db import get_db
 from app.models import User, UserSession, UserSettings
 from app.services.audit import record_audit
+from app.services.passwords import set_password
 
 # Registration is private: only an administrator can create accounts.
 router = APIRouter(prefix="/api/admin", tags=["admin"], dependencies=[*PRIVATE, Depends(require_admin)])
@@ -58,3 +60,24 @@ def set_user_active(
     )
     db.commit()
     return user
+
+
+@router.post("/users/{user_id}/password", status_code=204)
+def reset_user_password(
+    user_id: uuid.UUID, body: PasswordReset, request: Request,
+    admin: User = Depends(require_admin), db: Session = Depends(get_db),
+):
+    """Set a new password for another user and sign them out everywhere. Your own password is
+    changed from your account page, which asks for the current one."""
+    user = db.get(User, user_id)
+    if user is None:
+        raise HTTPException(404, "User not found.")
+    if user.id == admin.id:
+        raise HTTPException(400, "Use Change password on your account page for your own password.")
+    revoked = set_password(db, user, body.new_password)
+    email_limiter.reset(user.email)  # also lifts a sign-in lockout on that account
+    record_audit(
+        db, "password_reset", user_id=admin.id, ip=client_ip(request), entity_type="user",
+        entity_id=str(user.id), details={"sessions_revoked": revoked},
+    )
+    db.commit()
