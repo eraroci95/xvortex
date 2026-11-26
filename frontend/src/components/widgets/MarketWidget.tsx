@@ -17,6 +17,9 @@ export function MarketWidget({ data }: { data: DashboardSummary }) {
           ))}
         </ul>
       )}
+      {data.market_data_status === "end_of_day" && data.watchlists.length > 0 && (
+        <p className="mt-4 text-xs text-dim">Prices are end-of-day. Open Market to see the latest saved close for each symbol.</p>
+      )}
       {data.market_data_status === "unavailable" && (
         <div className="mt-4">
           <Unavailable>No price source is connected yet, so quotes and daily changes are not shown.</Unavailable>

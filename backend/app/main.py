@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.api import admin, auth, dashboard, notifications, settings as settings_api
+from app.api import admin, auth, borrowers, dashboard, loans, market, notifications, paper, settings as settings_api
 from app.core.config import get_settings
 from app.core.logging import configure_logging
 from app.db import SessionLocal, get_db
@@ -59,6 +59,10 @@ async def security_headers(request: Request, call_next):
 app.include_router(auth.router)
 app.include_router(admin.router)
 app.include_router(dashboard.router)
+app.include_router(borrowers.router)
+app.include_router(loans.router)
+app.include_router(market.router)
+app.include_router(paper.router)
 app.include_router(settings_api.router)
 app.include_router(notifications.router)
 

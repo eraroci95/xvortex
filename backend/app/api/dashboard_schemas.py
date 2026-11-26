@@ -18,6 +18,7 @@ class LoanTotalsOut(BaseModel):
 
 class PaperSummaryOut(BaseModel):
     accounts: int
+    excluded_accounts: int = 0  # accounts in another currency, left out of these totals
     currency: str
     cash: Decimal
     starting_cash: Decimal

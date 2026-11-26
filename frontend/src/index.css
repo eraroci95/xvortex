@@ -15,6 +15,9 @@
   --line: 140 175 255;
   --glow-a: 34 211 238;
   --glow-b: 139 92 246;
+  --chart-1: 14 165 196;
+  --chart-2: 139 92 246;
+  --chart-3: 217 138 31;
   color-scheme: dark;
 }
 :root[data-theme="light"] {
@@ -29,6 +32,9 @@
   --line: 40 70 140;
   --glow-a: 56 189 248;
   --glow-b: 167 139 250;
+  --chart-1: 8 133 168;
+  --chart-2: 109 40 217;
+  --chart-3: 180 83 9;
   color-scheme: light;
 }
 

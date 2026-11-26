@@ -15,12 +15,15 @@ class PaperAccount(Base):
     __tablename__ = "paper_accounts"
     __table_args__ = (
         CheckConstraint("cash_balance >= 0", name="cash_non_negative"),
+        CheckConstraint("length(currency) = 3", name="currency_length"),
         Index("ix_paper_accounts_user_id", "user_id"),
     )
 
     id: Mapped[UUIDPk]
     user_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("users.id", ondelete="CASCADE"))
     name: Mapped[str] = mapped_column(String(100))
+    # Cash and prices are taken to be in this currency; there is no conversion.
+    currency: Mapped[str] = mapped_column(String(3), server_default="SEK")
     starting_cash: Mapped[Money]
     cash_balance: Mapped[Money]
     created_at: Mapped[CreatedAt]

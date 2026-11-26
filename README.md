@@ -3,8 +3,8 @@
 Personal financial intelligence platform: loan management, market monitoring, paper trading
 (simulated only, never real orders), analytics and an optional AI assistant.
 
-**Status: phase 3 of 10 (Command Center).** Loans, Market, Paper Trading, Analytics and the Assistant arrive in
-phases 4 to 8; until then their pages say so and show no sample data.
+**Status: phase 6 of 10 (Paper trading).** Analytics and the Assistant arrive in
+phases 7 and 8; until then their pages say so and show no sample data.
 
 ## Repository layout
 
@@ -110,6 +110,56 @@ cookie work between the app and the API.
 - Widget order and visibility are saved per user via `PUT /api/settings/dashboard-layout`.
 - The bell in the top bar reads `GET /api/notifications` (each user sees only their own).
 
+## Loans (phase 4)
+
+- Borrowers and loans belong to one user. Every route filters by the signed-in user and answers 404 for anything
+  that is not theirs; the database also refuses a loan whose borrower belongs to a different user (composite foreign
+  key `fk_loans_borrower_same_user`) and checks frequency, method, status and currency.
+- `POST /api/loans/preview` builds a schedule without saving. Creating a loan stores its schedule; it is not
+  recomputed later, so changing code never rewrites an existing loan's dues.
+- Payments are dated on or after the loan start and not in the future. Overpayment is accepted and shown as
+  "paid beyond schedule". Deleting a payment is allowed and recalculates everything.
+- Status: `active` becomes `repaid` automatically when every installment is paid, and returns to `active` if a
+  payment is deleted. `closed` is set by hand and only changes by hand. Only repaid or closed loans can be archived,
+  and a borrower with active loans cannot be archived.
+- Risk is shown only for active, unarchived loans. Concentration compares a loan with the user's other open loans
+  in the same currency.
+- Not yet: editing the terms of a saved loan (create a new loan instead), recalculating interest after early
+  repayment, and CSV export (phase 7).
+
+## Market (phase 5)
+
+- Prices come from Alpha Vantage as **end-of-day** closes (the free plan serves the latest 100 trading days). Nothing
+  is live, and the page says so. Set `ALPHAVANTAGE_API_KEY` to turn prices on; without it watchlists still work and
+  prices show as unavailable. Nothing is ever estimated.
+- The free plan allows 25 requests a day and 5 a minute, so prices are saved in `market_data_cache`, shared by all
+  users, and reused for `MARKET_CACHE_HOURS` (12). Every provider request is counted before it is made, against
+  `ALPHAVANTAGE_DAILY_LIMIT` (20, per UTC day; the provider's own day may roll over at another time, so the
+  default leaves headroom). When the budget is used up or the provider fails, the last saved prices are shown
+  marked out of date.
+- Listing watchlists never calls the provider. Loading a chart does, once per symbol per cache period, and only for
+  symbols on one of your watchlists. "Refresh prices" is limited to once per 15 minutes per symbol.
+- SMA(20), SMA(50) and Wilder RSI(14) are calculated here from the saved closes. They describe past prices and are
+  not advice or predictions. A table view of the same numbers is one click away from the chart.
+- Not yet: symbol search, intraday data, valuing paper positions (phase 6) and news.
+
+## Paper trading (phase 6)
+
+- Everything is simulated: orders, trades and positions carry `is_simulated`, enforced `TRUE` by the database, and
+  no broker or exchange is ever contacted.
+- Orders are **market orders** filled at the latest saved end-of-day close (Market phase), with no fees. The fill
+  shows which trading day the price is from. Limit orders and fees are not built yet.
+- The price comes from the shared saved prices; if they are missing the order fetches them within the daily request
+  budget, and if that fails, or the latest close is more than 7 days old, the order is refused rather than
+  filled at an invented price. Only symbols on one of your watchlists can be traded.
+- Long only: no shorting, no margin. An order cannot spend more cash than the account has or sell more than it holds.
+  Buying updates a volume-weighted average entry price; selling realizes profit against that average.
+- Each account has one currency (migration 0003). Cash and prices are taken to be in it and nothing is converted,
+  so choose the currency the symbols trade in. The Command Center adds up only accounts in your display currency
+  and says how many were left out.
+- Market value and unrealized profit/loss use saved closes only. If an open position has no saved price the account
+  shows "needs prices" instead of a partial total.
+
 ## Design notes
 
 - Money, prices and quantities are `NUMERIC`/`Decimal`, never floats.
@@ -122,5 +172,5 @@ cookie work between the app and the API.
 
 ## Roadmap
 
-1 Architecture and database · 2 Auth and design system · **3 Command Center (this commit)** · 4 Loans ·
+1 Architecture and database · 2 Auth and design system · 3 Command Center · 4 Loans · 5 Market · **6 Paper trading (this commit)** ·
 5 Market intelligence · 6 Paper trading · 7 Analytics · 8 AI assistant · 9 Security and tests · 10 Final deploy

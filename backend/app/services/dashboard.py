@@ -8,11 +8,13 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.models import (
     Borrower, Loan, LoanPayment, LoanRepaymentSchedule, Notification, PaperAccount, PaperPosition,
     PaperTrade, User, UserSettings, Watchlist, WatchlistInstrument,
 )
 from app.services.loans.amortization import Installment, money
+from app.services.market.service import saved_close
 from app.services.loans.portfolio import LoanSnapshot, summarize_loans
 
 ZERO = Decimal("0.00")
@@ -44,23 +46,40 @@ def loan_snapshots(db: Session, user_id) -> list[LoanSnapshot]:
 
 
 def _paper(db: Session, user_id, currency: str) -> dict[str, Any]:
-    accounts = db.scalars(select(PaperAccount).where(PaperAccount.user_id == user_id)).all()
+    """Only accounts in the display currency are added up; amounts in other currencies are never mixed in
+    (excluded_accounts says how many were left out). Market value uses saved end-of-day closes only."""
+    all_accounts = db.scalars(select(PaperAccount).where(PaperAccount.user_id == user_id)).all()
+    accounts = [a for a in all_accounts if a.currency == currency]
     positions = []
     if accounts:
         positions = db.scalars(
             select(PaperPosition).where(PaperPosition.account_id.in_([a.id for a in accounts]))
         ).all()
-    invested = sum((p.quantity * p.avg_entry_price for p in positions if p.quantity > 0), ZERO)
+    open_positions = [p for p in positions if p.quantity > 0]
+    invested = sum((p.quantity * p.avg_entry_price for p in open_positions), ZERO)
+    market_value: Decimal | None = None
+    unrealized: Decimal | None = None
+    status = "unavailable"
+    if accounts:
+        closes = {p.symbol: saved_close(db, p.symbol) for p in open_positions}
+        priced = [p for p in open_positions if closes[p.symbol] is not None]
+        if not open_positions:
+            market_value, unrealized, status = ZERO, ZERO, "end_of_day"
+        elif priced:
+            market_value = money(sum((p.quantity * closes[p.symbol][0] for p in priced), ZERO))
+            unrealized = money(market_value - sum((p.quantity * p.avg_entry_price for p in priced), ZERO))
+            status = "end_of_day" if len(priced) == len(open_positions) else "partial"
     return {
         "accounts": len(accounts),
+        "excluded_accounts": len(all_accounts) - len(accounts),
         "currency": currency,
         "cash": money(sum((a.cash_balance for a in accounts), ZERO)),
         "starting_cash": money(sum((a.starting_cash for a in accounts), ZERO)),
         "invested_at_cost": money(invested),
         "realized_pnl": money(sum((p.realized_pnl for p in positions), ZERO)),
-        "market_value": None,
-        "unrealized_pnl": None,
-        "valuation_status": "unavailable",
+        "market_value": market_value,
+        "unrealized_pnl": unrealized,
+        "valuation_status": status,
     }
 
 
@@ -84,14 +103,14 @@ def _watchlists(db: Session, user_id) -> list[dict[str, Any]]:
 def _transactions(db: Session, user_id, currency: str) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     trades = db.scalars(
-        select(PaperTrade).join(PaperAccount, PaperTrade.account_id == PaperAccount.id)
+        select(PaperTrade, PaperAccount.currency).join(PaperAccount, PaperTrade.account_id == PaperAccount.id)
         .where(PaperAccount.user_id == user_id).order_by(PaperTrade.executed_at.desc()).limit(RECENT_LIMIT)
-    )
-    for t in trades:
+    ).all()
+    for t, account_currency in trades:
         verb = "Bought" if t.side == "buy" else "Sold"
         items.append({
             "kind": "paper_trade", "label": f"{verb} {t.quantity.normalize():f} {t.symbol}",
-            "amount": money(t.quantity * t.price), "currency": currency,
+            "amount": money(t.quantity * t.price), "currency": account_currency,
             "occurred_at": _utc(t.executed_at), "simulated": True,
         })
     payments = db.execute(
@@ -144,7 +163,7 @@ def build_summary(db: Session, user: User, today: date | None = None) -> dict[st
         ],
         "paper": _paper(db, user.id, currency),
         "watchlists": _watchlists(db, user.id),
-        "market_data_status": "unavailable",
+        "market_data_status": "end_of_day" if get_settings().alphavantage_api_key else "unavailable",
         "transactions": _transactions(db, user.id, currency),
         "news": {"status": "unavailable", "items": []},
         "notifications": {"unread": unread_count(db, user.id), "latest": notification_items(db, user.id, 5)},

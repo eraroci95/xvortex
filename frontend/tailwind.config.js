@@ -7,7 +7,7 @@ export default {
     extend: {
       colors: {
         ink: c("ink"), panel: c("panel"), fg: c("fg"), dim: c("dim"),
-        cyan: c("cyan"), azure: c("azure"), violet: c("violet"), danger: c("danger"),
+        cyan: c("cyan"), azure: c("azure"), violet: c("violet"), danger: c("danger"), line: c("line"),
       },
       fontFamily: {
         sans: ["Sora", "system-ui", "sans-serif"],

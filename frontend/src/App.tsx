@@ -6,6 +6,12 @@ import { ThemeProvider } from "./theme/ThemeContext";
 import Account from "./pages/Account";
 import Admin from "./pages/Admin";
 import CommandCenter from "./pages/CommandCenter";
+import Borrowers from "./pages/Borrowers";
+import LoanDetail from "./pages/LoanDetail";
+import Loans from "./pages/Loans";
+import Paper from "./pages/Paper";
+import Market from "./pages/Market";
+import NewLoan from "./pages/NewLoan";
 import ComingSoon from "./pages/ComingSoon";
 import Login from "./pages/Login";
 
@@ -38,9 +44,12 @@ export default function App() {
             <Route element={<RequireAuth />}>
               <Route element={<AppShell />}>
                 <Route index element={<CommandCenter />} />
-                <Route path="loans" element={<ComingSoon title="Loans" phase={4}>Borrowers, loans, repayment schedules and payments will be managed here.</ComingSoon>} />
-                <Route path="market" element={<ComingSoon title="Market" phase={5}>Watchlists, charts and indicators will appear here, each with a clear data-freshness label.</ComingSoon>} />
-                <Route path="paper" element={<ComingSoon title="Paper Trading" phase={6}>Simulated orders and positions will live here. No real orders are ever placed.</ComingSoon>} />
+                <Route path="loans" element={<Loans />} />
+                <Route path="loans/new" element={<NewLoan />} />
+                <Route path="loans/borrowers" element={<Borrowers />} />
+                <Route path="loans/:id" element={<LoanDetail />} />
+                <Route path="market" element={<Market />} />
+                <Route path="paper" element={<Paper />} />
                 <Route path="analytics" element={<ComingSoon title="Analytics" phase={7}>Loan, portfolio and cash-flow reports with CSV and PDF export will be here.</ComingSoon>} />
                 <Route path="assistant" element={<ComingSoon title="Assistant" phase={8}>An optional assistant that explains your data. It only sees your data if you allow it.</ComingSoon>} />
                 <Route path="account" element={<Account />} />

@@ -21,6 +21,12 @@ class Settings(BaseSettings):
     # Password hashing uses ~64 MiB per call; this caps how many run at once so a burst of logins
     # cannot exhaust a small instance's memory.
     password_hash_concurrency: int = Field(default=2, ge=1, le=16)
+    # Market data (Alpha Vantage, end-of-day prices). Without a key the Market page works for watchlists
+    # only and says prices are unavailable. The free plan allows 25 requests a day; the limit below is
+    # what this app will spend, leaving headroom for requests made outside it.
+    alphavantage_api_key: str | None = None
+    alphavantage_daily_limit: int = Field(default=20, ge=1, le=25)
+    market_cache_hours: int = Field(default=12, ge=1, le=72)
     # Optional first-run bootstrap: creates this admin only if the users table is empty.
     admin_email: str | None = None
     admin_password: str | None = None

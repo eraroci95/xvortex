@@ -25,13 +25,28 @@ export function PaperWidget({ data }: { data: DashboardSummary }) {
               tone={isNegative(p.realized_pnl) ? "danger" : Number(p.realized_pnl) > 0 ? "good" : undefined} />
             <Row label="Starting cash" value={formatMoney(p.starting_cash, p.currency)} />
           </dl>
-          {p.valuation_status === "unavailable" && (
+          {p.market_value !== null && p.unrealized_pnl !== null && (
+            <dl className="mt-1 divide-y divide-white/5">
+              <Row label={p.valuation_status === "partial" ? "Market value (priced positions only)" : "Market value, last close"}
+                value={formatMoney(p.market_value, p.currency)} />
+              <Row label="Unrealized profit/loss" value={formatMoney(p.unrealized_pnl, p.currency)}
+                tone={isNegative(p.unrealized_pnl) ? "danger" : Number(p.unrealized_pnl) > 0 ? "good" : undefined} />
+            </dl>
+          )}
+          {p.valuation_status !== "end_of_day" && (
             <div className="mt-3">
               <Unavailable>
-                Portfolio value and unrealized profit/loss need live prices, which are not connected yet.
-                Invested amounts are shown at purchase cost.
+                {p.valuation_status === "partial"
+                  ? "Some positions have no saved price, so they are left out of the market value. Load them in Market."
+                  : "Positions have no saved price yet. Load their prices in Market to see their value."}
               </Unavailable>
             </div>
+          )}
+          {p.excluded_accounts > 0 && (
+            <p className="mt-3 text-xs text-dim">
+              {p.excluded_accounts} account{p.excluded_accounts === 1 ? "" : "s"} in another currency {p.excluded_accounts === 1 ? "is" : "are"} not
+              included. Amounts in different currencies are never added together.
+            </p>
           )}
         </>
       )}

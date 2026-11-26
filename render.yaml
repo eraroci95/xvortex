@@ -23,6 +23,10 @@ services:
         value: "1"           # proxies that append to X-Forwarded-For; check the README after first deploy
       - key: PASSWORD_HASH_CONCURRENCY
         value: "2"           # password hashes allowed at once (about 64 MiB each; the instance has 512 MB)
+      - key: ALPHAVANTAGE_API_KEY
+        sync: false          # optional: free key from alphavantage.co; without it prices are unavailable
+      - key: ALPHAVANTAGE_DAILY_LIMIT
+        value: "20"          # free plan allows 25 a day; this app stops at 20
       - key: ADMIN_EMAIL
         sync: false          # first administrator (used only if no users exist yet)
       - key: ADMIN_PASSWORD

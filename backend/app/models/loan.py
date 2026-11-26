@@ -2,7 +2,7 @@ import uuid
 from datetime import date, datetime
 
 from sqlalchemy import (
-    CheckConstraint, Date, DateTime, ForeignKey, Index, Integer, String, Text,
+    CheckConstraint, Date, DateTime, ForeignKey, ForeignKeyConstraint, Index, Integer, String, Text,
     UniqueConstraint, Uuid, func,
 )
 from sqlalchemy.orm import Mapped, mapped_column
@@ -12,7 +12,11 @@ from .base import Base, CreatedAt, Money, Rate, UUIDPk
 
 class Borrower(Base):
     __tablename__ = "borrowers"
-    __table_args__ = (Index("ix_borrowers_user_id_name", "user_id", "name"),)
+    __table_args__ = (
+        Index("ix_borrowers_user_id_name", "user_id", "name"),
+        # Lets loans reference (id, user_id), so a loan can only use a borrower of the same user.
+        UniqueConstraint("id", "user_id", name="uq_borrowers_id_user_id"),
+    )
 
     id: Mapped[UUIDPk]
     user_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("users.id", ondelete="CASCADE"))
@@ -33,13 +37,27 @@ class Loan(Base):
         CheckConstraint("principal > 0", name="principal_positive"),
         CheckConstraint("annual_interest_rate >= 0", name="rate_non_negative"),
         CheckConstraint("maturity_date > start_date", name="maturity_after_start"),
+        CheckConstraint(
+            "repayment_frequency IN ('weekly','biweekly','monthly','quarterly','semiannual','annual')",
+            name="frequency_valid",
+        ),
+        CheckConstraint(
+            "amortization_method IN ('annuity','equal_principal','interest_only')", name="method_valid",
+        ),
+        # active: being repaid; repaid: set automatically when payments cover the schedule; closed: set by hand.
+        CheckConstraint("status IN ('active','repaid','closed')", name="status_valid"),
+        CheckConstraint("length(currency) = 3", name="currency_length"),
+        ForeignKeyConstraint(
+            ["borrower_id", "user_id"], ["borrowers.id", "borrowers.user_id"],
+            ondelete="RESTRICT", name="fk_loans_borrower_same_user",
+        ),
         Index("ix_loans_user_id_status", "user_id", "status"),
         Index("ix_loans_borrower_id", "borrower_id"),
     )
 
     id: Mapped[UUIDPk]
     user_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("users.id", ondelete="CASCADE"))
-    borrower_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("borrowers.id", ondelete="RESTRICT"))
+    borrower_id: Mapped[uuid.UUID] = mapped_column(Uuid)  # foreign key: see fk_loans_borrower_same_user
     principal: Mapped[Money]
     annual_interest_rate: Mapped[Rate]  # percent, e.g. 7.5 means 7.5% per year
     currency: Mapped[str] = mapped_column(String(3), server_default="SEK")
