@@ -1,0 +1,2028 @@
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p4/README.md xvortex/README.md
+--- a/README.md	2026-11-26 23:06:53.000000000 +0100
++++ b/README.md	2026-11-26 23:39:43.267322640 +0100
+@@ -3,8 +3,8 @@
+ Personal financial intelligence platform: loan management, market monitoring, paper trading
+ (simulated only, never real orders), analytics and an optional AI assistant.
+ 
+-**Status: phase 3 of 10 (Command Center).** Loans, Market, Paper Trading, Analytics and the Assistant arrive in
+-phases 4 to 8; until then their pages say so and show no sample data.
++**Status: phase 4 of 10 (Loans).** Market, Paper Trading, Analytics and the Assistant arrive in
++phases 5 to 8; until then their pages say so and show no sample data.
+ 
+ ## Repository layout
+ 
+@@ -110,6 +110,23 @@
+ - Widget order and visibility are saved per user via `PUT /api/settings/dashboard-layout`.
+ - The bell in the top bar reads `GET /api/notifications` (each user sees only their own).
+ 
++## Loans (phase 4)
++
++- Borrowers and loans belong to one user. Every route filters by the signed-in user and answers 404 for anything
++  that is not theirs; the database also refuses a loan whose borrower belongs to a different user (composite foreign
++  key `fk_loans_borrower_same_user`) and checks frequency, method, status and currency.
++- `POST /api/loans/preview` builds a schedule without saving. Creating a loan stores its schedule; it is not
++  recomputed later, so changing code never rewrites an existing loan's dues.
++- Payments are dated on or after the loan start and not in the future. Overpayment is accepted and shown as
++  "paid beyond schedule". Deleting a payment is allowed and recalculates everything.
++- Status: `active` becomes `repaid` automatically when every installment is paid, and returns to `active` if a
++  payment is deleted. `closed` is set by hand and only changes by hand. Only repaid or closed loans can be archived,
++  and a borrower with active loans cannot be archived.
++- Risk is shown only for active, unarchived loans. Concentration compares a loan with the user's other open loans
++  in the same currency.
++- Not yet: editing the terms of a saved loan (create a new loan instead), recalculating interest after early
++  repayment, and CSV export (phase 7).
++
+ ## Design notes
+ 
+ - Money, prices and quantities are `NUMERIC`/`Decimal`, never floats.
+@@ -122,5 +139,5 @@
+ 
+ ## Roadmap
+ 
+-1 Architecture and database · 2 Auth and design system · **3 Command Center (this commit)** · 4 Loans ·
++1 Architecture and database · 2 Auth and design system · 3 Command Center · **4 Loans (this commit)** ·
+ 5 Market intelligence · 6 Paper trading · 7 Analytics · 8 AI assistant · 9 Security and tests · 10 Final deploy
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p4/backend/alembic/versions/0002_loan_constraints.py xvortex/backend/alembic/versions/0002_loan_constraints.py
+--- a/backend/alembic/versions/0002_loan_constraints.py	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/alembic/versions/0002_loan_constraints.py	2026-11-26 23:34:33.838809689 +0100
+@@ -0,0 +1,43 @@
++"""loans: borrower must belong to the same user, and valid frequency, method, status and currency
++
++Revision ID: 0002
++Revises: 0001
++"""
++import sqlalchemy as sa
++from alembic import op
++
++revision = "0002"
++down_revision = "0001"
++branch_labels = None
++depends_on = None
++
++FREQUENCIES = "'weekly','biweekly','monthly','quarterly','semiannual','annual'"
++METHODS = "'annuity','equal_principal','interest_only'"
++STATUSES = "'active','repaid','closed'"
++
++
++def upgrade() -> None:
++    op.create_unique_constraint("uq_borrowers_id_user_id", "borrowers", ["id", "user_id"])
++
++    # Replace the single-column borrower FK with one that also pins user_id. The old FK is looked up
++    # by its columns rather than its name, so this works whichever name the first migration produced.
++    for fk in sa.inspect(op.get_bind()).get_foreign_keys("loans"):
++        if fk["referred_table"] == "borrowers" and fk["constrained_columns"] == ["borrower_id"]:
++            op.drop_constraint(fk["name"], "loans", type_="foreignkey")
++    op.create_foreign_key(
++        "fk_loans_borrower_same_user", "loans", "borrowers",
++        ["borrower_id", "user_id"], ["id", "user_id"], ondelete="RESTRICT",
++    )
++
++    op.create_check_constraint("frequency_valid", "loans", f"repayment_frequency IN ({FREQUENCIES})")
++    op.create_check_constraint("method_valid", "loans", f"amortization_method IN ({METHODS})")
++    op.create_check_constraint("status_valid", "loans", f"status IN ({STATUSES})")
++    op.create_check_constraint("currency_length", "loans", "length(currency) = 3")
++
++
++def downgrade() -> None:
++    for name in ("currency_length", "status_valid", "method_valid", "frequency_valid"):
++        op.drop_constraint(name, "loans", type_="check")
++    op.drop_constraint("fk_loans_borrower_same_user", "loans", type_="foreignkey")
++    op.create_foreign_key("fk_loans_borrower_id_borrowers", "loans", "borrowers", ["borrower_id"], ["id"], ondelete="RESTRICT")
++    op.drop_constraint("uq_borrowers_id_user_id", "borrowers", type_="unique")
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p4/backend/app/api/borrowers.py xvortex/backend/app/api/borrowers.py
+--- a/backend/app/api/borrowers.py	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/app/api/borrowers.py	2026-11-26 23:36:55.048514225 +0100
+@@ -0,0 +1,100 @@
++import uuid
++from datetime import datetime, timezone
++
++from fastapi import APIRouter, Depends, HTTPException, Request
++from sqlalchemy import func, select
++from sqlalchemy.orm import Session
++
++from app.api.deps import PRIVATE, client_ip, current_user
++from app.api.loan_schemas import BorrowerIn, BorrowerOut, BorrowerPatch
++from app.db import get_db
++from app.models import Borrower, Loan, User
++from app.services.audit import record_audit
++
++router = APIRouter(prefix="/api/borrowers", tags=["borrowers"], dependencies=PRIVATE)
++
++
++def _counts(db: Session, user_id, ids: list) -> dict:
++    if not ids:
++        return {}
++    rows = db.execute(
++        select(
++            Loan.borrower_id, func.count(Loan.id),
++            func.count(Loan.id).filter(Loan.status == "active", Loan.archived_at.is_(None)),
++        ).where(Loan.user_id == user_id, Loan.borrower_id.in_(ids)).group_by(Loan.borrower_id)
++    ).all()
++    return {r[0]: (r[1], r[2]) for r in rows}
++
++
++def _out(b: Borrower, counts: dict) -> BorrowerOut:
++    total, active = counts.get(b.id, (0, 0))
++    return BorrowerOut(
++        id=b.id, name=b.name, email=b.email, phone=b.phone, notes=b.notes, archived=b.archived_at is not None,
++        loan_count=total, active_loan_count=active, created_at=b.created_at,
++    )
++
++
++def _owned(db: Session, user: User, borrower_id: uuid.UUID, lock: bool = False) -> Borrower:
++    stmt = select(Borrower).where(Borrower.id == borrower_id, Borrower.user_id == user.id)
++    if lock:
++        stmt = stmt.with_for_update()
++    b = db.scalar(stmt)
++    if b is None:
++        raise HTTPException(404, "Borrower not found.")
++    return b
++
++
++@router.get("", response_model=list[BorrowerOut])
++def list_borrowers(include_archived: bool = False, user: User = Depends(current_user), db: Session = Depends(get_db)):
++    stmt = select(Borrower).where(Borrower.user_id == user.id).order_by(func.lower(Borrower.name), Borrower.id)
++    if not include_archived:
++        stmt = stmt.where(Borrower.archived_at.is_(None))
++    rows = db.scalars(stmt).all()
++    counts = _counts(db, user.id, [b.id for b in rows])
++    return [_out(b, counts) for b in rows]
++
++
++@router.post("", response_model=BorrowerOut, status_code=201)
++def create_borrower(
++    body: BorrowerIn, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db),
++):
++    b = Borrower(user_id=user.id, name=body.name, email=body.email, phone=body.phone, notes=body.notes)
++    db.add(b)
++    db.flush()
++    db.refresh(b)  # loads created_at, which the database fills in
++    record_audit(db, "borrower_created", user_id=user.id, ip=client_ip(request), entity_type="borrower", entity_id=str(b.id))
++    db.commit()
++    return _out(b, {})
++
++
++@router.patch("/{borrower_id}", response_model=BorrowerOut)
++def update_borrower(
++    borrower_id: uuid.UUID, body: BorrowerPatch, request: Request,
++    user: User = Depends(current_user), db: Session = Depends(get_db),
++):
++    b = _owned(db, user, borrower_id, lock=True)
++    sent = body.model_fields_set
++    if "name" in sent and body.name is not None:
++        b.name = body.name
++    for field in ("email", "phone", "notes"):
++        if field in sent:
++            setattr(b, field, getattr(body, field))
++    if "archived" in sent and body.archived is not None:
++        if body.archived and b.archived_at is None:
++            active = db.scalar(
++                select(func.count(Loan.id)).where(
++                    Loan.borrower_id == b.id, Loan.user_id == user.id,
++                    Loan.status == "active", Loan.archived_at.is_(None),
++                )
++            )
++            if active:
++                raise HTTPException(409, "This borrower still has active loans. Close or archive them first.")
++            b.archived_at = datetime.now(timezone.utc)
++        elif not body.archived:
++            b.archived_at = None
++    record_audit(
++        db, "borrower_updated", user_id=user.id, ip=client_ip(request), entity_type="borrower",
++        entity_id=str(b.id), details={"fields": sorted(sent)},
++    )
++    db.commit()
++    return _out(b, _counts(db, user.id, [b.id]))
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p4/backend/app/api/loan_schemas.py xvortex/backend/app/api/loan_schemas.py
+--- a/backend/app/api/loan_schemas.py	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/app/api/loan_schemas.py	2026-11-26 23:36:04.847238874 +0100
+@@ -0,0 +1,194 @@
++"""Request and response shapes for borrowers, loans and payments. Imports only pydantic."""
++import re
++import uuid
++from datetime import date, datetime
++from decimal import Decimal
++from typing import Literal
++
++from pydantic import BaseModel, Field, field_validator, model_validator
++
++Frequency = Literal["weekly", "biweekly", "monthly", "quarterly", "semiannual", "annual"]
++Method = Literal["annuity", "equal_principal", "interest_only"]
++LoanStatus = Literal["active", "repaid", "closed"]
++EMAIL_PATTERN = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
++
++
++def _clean(v: str | None) -> str | None:
++    if v is None:
++        return None
++    v = v.strip()
++    return v or None
++
++
++def _email_or_none(v: str | None) -> str | None:
++    v = _clean(v)
++    if v is not None and not re.match(EMAIL_PATTERN, v):
++        raise ValueError("Enter a valid email address.")
++    return v
++
++
++class BorrowerIn(BaseModel):
++    name: str = Field(min_length=1, max_length=200)
++    email: str | None = Field(default=None, max_length=320)
++    phone: str | None = Field(default=None, max_length=50)
++    notes: str | None = Field(default=None, max_length=5000)
++
++    @field_validator("name")
++    @classmethod
++    def _name(cls, v: str) -> str:
++        v = v.strip()
++        if not v:
++            raise ValueError("Name must not be blank.")
++        return v
++
++    @field_validator("email")
++    @classmethod
++    def _email(cls, v: str | None) -> str | None:
++        return _email_or_none(v)
++
++    @field_validator("phone", "notes")
++    @classmethod
++    def _blank_to_none(cls, v: str | None) -> str | None:
++        return _clean(v)
++
++
++class BorrowerPatch(BaseModel):
++    """Only the fields sent are changed. Send an empty string to clear email, phone or notes."""
++    name: str | None = Field(default=None, min_length=1, max_length=200)
++    email: str | None = Field(default=None, max_length=320)
++    phone: str | None = Field(default=None, max_length=50)
++    notes: str | None = Field(default=None, max_length=5000)
++    archived: bool | None = None
++
++    @field_validator("name")
++    @classmethod
++    def _name(cls, v: str | None) -> str | None:
++        if v is None:
++            return v
++        v = v.strip()
++        if not v:
++            raise ValueError("Name must not be blank.")
++        return v
++
++    @field_validator("email")
++    @classmethod
++    def _email(cls, v: str | None) -> str | None:
++        return _email_or_none(v)
++
++
++class BorrowerOut(BaseModel):
++    id: uuid.UUID
++    name: str
++    email: str | None
++    phone: str | None
++    notes: str | None
++    archived: bool
++    loan_count: int
++    active_loan_count: int
++    created_at: datetime
++
++
++class LoanTermsIn(BaseModel):
++    principal: Decimal = Field(gt=0, max_digits=16, decimal_places=2)
++    annual_interest_rate: Decimal = Field(ge=0, lt=1000, max_digits=7, decimal_places=4)
++    currency: str = Field(default="SEK", pattern=r"^[A-Z]{3}$")
++    start_date: date
++    maturity_date: date
++    repayment_frequency: Frequency = "monthly"
++    amortization_method: Method = "annuity"
++
++    @model_validator(mode="after")
++    def _dates(self):
++        if self.maturity_date <= self.start_date:
++            raise ValueError("Maturity date must be after the start date.")
++        return self
++
++
++class LoanIn(LoanTermsIn):
++    borrower_id: uuid.UUID
++    notes: str | None = Field(default=None, max_length=5000)
++
++    @field_validator("notes")
++    @classmethod
++    def _notes(cls, v: str | None) -> str | None:
++        return _clean(v)
++
++
++class LoanPatch(BaseModel):
++    notes: str | None = Field(default=None, max_length=5000)
++    status: Literal["active", "closed"] | None = None  # repaid is automatic, never set by hand
++    archived: bool | None = None
++
++
++class PaymentIn(BaseModel):
++    paid_on: date
++    amount: Decimal = Field(gt=0, max_digits=16, decimal_places=2)
++    note: str | None = Field(default=None, max_length=500)
++
++    @field_validator("note")
++    @classmethod
++    def _note(cls, v: str | None) -> str | None:
++        return _clean(v)
++
++
++class InstallmentOut(BaseModel):
++    number: int
++    due_date: date
++    principal: Decimal
++    interest: Decimal
++    total: Decimal
++    paid_principal: Decimal
++    paid_interest: Decimal
++    outstanding: Decimal
++    status: Literal["paid", "partial", "overdue", "upcoming"]
++
++
++class PaymentOut(BaseModel):
++    id: uuid.UUID
++    paid_on: date
++    amount: Decimal
++    note: str | None
++
++
++class PreviewOut(BaseModel):
++    installments: list[InstallmentOut]
++    total_principal: Decimal
++    total_interest: Decimal
++    total_repayable: Decimal
++
++
++class RiskOut(BaseModel):
++    level: Literal["low", "medium", "high"]
++    triggers: list[str]
++    disclaimer: str
++
++
++class LoanSummaryOut(BaseModel):
++    id: uuid.UUID
++    borrower_id: uuid.UUID
++    borrower_name: str
++    principal: Decimal
++    annual_interest_rate: Decimal
++    currency: str
++    start_date: date
++    maturity_date: date
++    repayment_frequency: str
++    amortization_method: str
++    status: str
++    archived: bool
++    outstanding_principal: Decimal
++    remaining_interest: Decimal
++    overdue_amount: Decimal
++    overdue_installments: int
++    unapplied_payments: Decimal
++    next_due_date: date | None
++    next_due_amount: Decimal | None
++    risk: RiskOut | None  # only for active, unarchived loans
++
++
++class LoanDetailOut(LoanSummaryOut):
++    notes: str | None
++    created_at: datetime
++    total_paid: Decimal
++    schedule: list[InstallmentOut]
++    payments: list[PaymentOut]
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p4/backend/app/api/loans.py xvortex/backend/app/api/loans.py
+--- a/backend/app/api/loans.py	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/app/api/loans.py	2026-11-26 23:36:55.075083658 +0100
+@@ -0,0 +1,227 @@
++import uuid
++from datetime import date, datetime, timezone
++from typing import Literal
++
++from fastapi import APIRouter, Depends, HTTPException, Request
++from sqlalchemy import select
++from sqlalchemy.orm import Session
++
++from app.api.deps import PRIVATE, client_ip, current_user
++from app.api.loan_schemas import (
++    LoanDetailOut, LoanIn, LoanPatch, LoanSummaryOut, LoanTermsIn, PaymentIn, PaymentOut, PreviewOut,
++)
++from app.db import get_db
++from app.models import Borrower, Loan, LoanPayment, LoanRepaymentSchedule, User
++from app.services.audit import record_audit
++from app.services.loan_data import (
++    figures_for, installment_out, load_facts, summary_fields, summary_out,
++)
++from app.services.loans.amortization import allocate_payments, build_schedule, money
++from app.services.loans.views import assess_all, desired_status, schedule_totals
++
++router = APIRouter(prefix="/api/loans", tags=["loans"], dependencies=PRIVATE)
++
++
++def _today() -> date:
++    return datetime.now(timezone.utc).date()
++
++
++def _schedule_or_422(terms: LoanTermsIn):
++    try:
++        return build_schedule(
++            terms.principal, terms.annual_interest_rate, terms.start_date, terms.maturity_date,
++            terms.repayment_frequency, terms.amortization_method,
++        )
++    except ValueError as exc:  # e.g. too many installments for the chosen period
++        raise HTTPException(422, str(exc))
++
++
++def _owned(db: Session, user: User, loan_id: uuid.UUID, lock: bool = False) -> Loan:
++    stmt = select(Loan).where(Loan.id == loan_id, Loan.user_id == user.id)
++    if lock:
++        stmt = stmt.with_for_update()  # serialises concurrent payment changes on one loan
++    loan = db.scalar(stmt)
++    if loan is None:
++        raise HTTPException(404, "Loan not found.")
++    return loan
++
++
++def _names(db: Session, user: User) -> dict:
++    return {b.id: b.name for b in db.scalars(select(Borrower).where(Borrower.user_id == user.id))}
++
++
++def _detail(db: Session, user: User, loan: Loan) -> LoanDetailOut:
++    """Risk is judged against all of the user's open loans in the same currency."""
++    today = _today()
++    others = list(db.scalars(select(Loan).where(Loan.user_id == user.id)))
++    pairs = figures_for(load_facts(db, others), today)
++    risks = assess_all(pairs, today)
++    fig = next(fig for f, fig in pairs if f.loan_id == loan.id)
++    payments = db.scalars(
++        select(LoanPayment).where(LoanPayment.loan_id == loan.id).order_by(LoanPayment.paid_on, LoanPayment.created_at)
++    ).all()
++    name = _names(db, user).get(loan.borrower_id, "")
++    return LoanDetailOut(
++        **summary_fields(loan, name, fig, risks.get(loan.id)),
++        notes=loan.notes, created_at=loan.created_at,
++        total_paid=money(sum((p.amount for p in payments), money(0))),
++        schedule=[installment_out(a, today) for a in fig.allocations],
++        payments=[PaymentOut(id=p.id, paid_on=p.paid_on, amount=p.amount, note=p.note) for p in payments],
++    )
++
++
++@router.post("/preview", response_model=PreviewOut)
++def preview(terms: LoanTermsIn):
++    schedule = _schedule_or_422(terms)
++    allocations, _ = allocate_payments(schedule, [])
++    p, i, total = schedule_totals(schedule)
++    return PreviewOut(
++        installments=[installment_out(a, _today()) for a in allocations],
++        total_principal=p, total_interest=i, total_repayable=total,
++    )
++
++
++@router.get("", response_model=list[LoanSummaryOut])
++def list_loans(
++    view: Literal["active", "finished", "archived", "all"] = "active",
++    user: User = Depends(current_user), db: Session = Depends(get_db),
++):
++    today = _today()
++    loans = list(db.scalars(select(Loan).where(Loan.user_id == user.id).order_by(Loan.start_date.desc(), Loan.id)))
++    pairs = figures_for(load_facts(db, loans), today)
++    risks = assess_all(pairs, today)
++    names = _names(db, user)
++    by_id = {fig_f.loan_id: fig for fig_f, fig in pairs}
++
++    def wanted(loan: Loan) -> bool:
++        archived = loan.archived_at is not None
++        if view == "all":
++            return True
++        if view == "archived":
++            return archived
++        if archived:
++            return False
++        return loan.status == "active" if view == "active" else loan.status != "active"
++
++    return [
++        summary_out(l, names.get(l.borrower_id, ""), by_id[l.id], risks.get(l.id)) for l in loans if wanted(l)
++    ]
++
++
++@router.post("", response_model=LoanDetailOut, status_code=201)
++def create_loan(body: LoanIn, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
++    borrower = db.scalar(
++        select(Borrower).where(Borrower.id == body.borrower_id, Borrower.user_id == user.id).with_for_update()
++    )
++    if borrower is None:
++        raise HTTPException(404, "Borrower not found.")
++    if borrower.archived_at is not None:
++        raise HTTPException(409, "This borrower is archived. Restore them before adding a loan.")
++    schedule = _schedule_or_422(body)
++    loan = Loan(
++        user_id=user.id, borrower_id=borrower.id, principal=body.principal,
++        annual_interest_rate=body.annual_interest_rate, currency=body.currency, start_date=body.start_date,
++        maturity_date=body.maturity_date, repayment_frequency=body.repayment_frequency,
++        amortization_method=body.amortization_method, notes=body.notes, status="active",
++    )
++    db.add(loan)
++    db.flush()
++    db.refresh(loan)
++    for i in schedule:
++        db.add(LoanRepaymentSchedule(
++            loan_id=loan.id, installment_no=i.number, due_date=i.due_date,
++            principal_due=i.principal, interest_due=i.interest,
++        ))
++    record_audit(
++        db, "loan_created", user_id=user.id, ip=client_ip(request), entity_type="loan", entity_id=str(loan.id),
++        details={"currency": loan.currency, "installments": len(schedule)},
++    )
++    db.commit()
++    return _detail(db, user, loan)
++
++
++@router.get("/{loan_id}", response_model=LoanDetailOut)
++def get_loan(loan_id: uuid.UUID, user: User = Depends(current_user), db: Session = Depends(get_db)):
++    return _detail(db, user, _owned(db, user, loan_id))
++
++
++def _resync_status(db: Session, loan: Loan) -> None:
++    """Move an open loan between active and repaid to match its payments. Closed stays closed."""
++    fig = figures_for(load_facts(db, [loan]), _today())[0][1]
++    loan.status = desired_status(loan.status, fig)
++
++
++@router.patch("/{loan_id}", response_model=LoanDetailOut)
++def update_loan(
++    loan_id: uuid.UUID, body: LoanPatch, request: Request,
++    user: User = Depends(current_user), db: Session = Depends(get_db),
++):
++    loan = _owned(db, user, loan_id, lock=True)
++    sent = body.model_fields_set
++    if "notes" in sent:
++        loan.notes = (body.notes or "").strip() or None
++    if "status" in sent and body.status is not None:
++        if body.status == "closed":
++            loan.status = "closed"
++        elif loan.status == "closed":
++            loan.status = "active"
++            db.flush()
++            _resync_status(db, loan)  # reopening a fully paid loan makes it repaid, not active
++    if "archived" in sent and body.archived is not None:
++        if body.archived:
++            if loan.status == "active":
++                raise HTTPException(409, "Only repaid or closed loans can be archived.")
++            loan.archived_at = loan.archived_at or datetime.now(timezone.utc)
++        else:
++            loan.archived_at = None
++    record_audit(
++        db, "loan_updated", user_id=user.id, ip=client_ip(request), entity_type="loan", entity_id=str(loan.id),
++        details={"fields": sorted(sent), "status": loan.status},
++    )
++    db.commit()
++    return _detail(db, user, loan)
++
++
++@router.post("/{loan_id}/payments", response_model=LoanDetailOut, status_code=201)
++def add_payment(
++    loan_id: uuid.UUID, body: PaymentIn, request: Request,
++    user: User = Depends(current_user), db: Session = Depends(get_db),
++):
++    loan = _owned(db, user, loan_id, lock=True)
++    if loan.status != "active":
++        raise HTTPException(409, f"This loan is {loan.status}. Payments can only be added to active loans.")
++    if body.paid_on < loan.start_date:
++        raise HTTPException(422, "A payment cannot be dated before the loan starts.")
++    if body.paid_on > _today():
++        raise HTTPException(422, "A payment cannot be dated in the future.")
++    payment = LoanPayment(loan_id=loan.id, paid_on=body.paid_on, amount=body.amount, note=body.note)
++    db.add(payment)
++    db.flush()
++    _resync_status(db, loan)
++    record_audit(
++        db, "loan_payment_added", user_id=user.id, ip=client_ip(request), entity_type="loan", entity_id=str(loan.id),
++        details={"payment_id": str(payment.id), "amount": str(body.amount), "status": loan.status},
++    )
++    db.commit()
++    return _detail(db, user, loan)
++
++
++@router.delete("/{loan_id}/payments/{payment_id}", response_model=LoanDetailOut)
++def delete_payment(
++    loan_id: uuid.UUID, payment_id: uuid.UUID, request: Request,
++    user: User = Depends(current_user), db: Session = Depends(get_db),
++):
++    loan = _owned(db, user, loan_id, lock=True)
++    payment = db.scalar(select(LoanPayment).where(LoanPayment.id == payment_id, LoanPayment.loan_id == loan.id))
++    if payment is None:
++        raise HTTPException(404, "Payment not found.")
++    amount = payment.amount
++    db.delete(payment)
++    db.flush()
++    _resync_status(db, loan)
++    record_audit(
++        db, "loan_payment_deleted", user_id=user.id, ip=client_ip(request), entity_type="loan", entity_id=str(loan.id),
++        details={"payment_id": str(payment_id), "amount": str(amount), "status": loan.status},
++    )
++    db.commit()
++    return _detail(db, user, loan)
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p4/backend/app/main.py xvortex/backend/app/main.py
+--- a/backend/app/main.py	2026-11-26 22:45:11.000000000 +0100
++++ b/backend/app/main.py	2026-11-26 23:37:02.156874352 +0100
+@@ -6,7 +6,7 @@
+ from sqlalchemy import text
+ from sqlalchemy.orm import Session
+ 
+-from app.api import admin, auth, dashboard, notifications, settings as settings_api
++from app.api import admin, auth, borrowers, dashboard, loans, notifications, settings as settings_api
+ from app.core.config import get_settings
+ from app.core.logging import configure_logging
+ from app.db import SessionLocal, get_db
+@@ -59,6 +59,8 @@
+ app.include_router(auth.router)
+ app.include_router(admin.router)
+ app.include_router(dashboard.router)
++app.include_router(borrowers.router)
++app.include_router(loans.router)
+ app.include_router(settings_api.router)
+ app.include_router(notifications.router)
+ 
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p4/backend/app/models/loan.py xvortex/backend/app/models/loan.py
+--- a/backend/app/models/loan.py	2026-11-24 02:46:40.000000000 +0100
++++ b/backend/app/models/loan.py	2026-11-26 23:34:33.835468305 +0100
+@@ -2,7 +2,7 @@
+ from datetime import date, datetime
+ 
+ from sqlalchemy import (
+-    CheckConstraint, Date, DateTime, ForeignKey, Index, Integer, String, Text,
++    CheckConstraint, Date, DateTime, ForeignKey, ForeignKeyConstraint, Index, Integer, String, Text,
+     UniqueConstraint, Uuid, func,
+ )
+ from sqlalchemy.orm import Mapped, mapped_column
+@@ -12,7 +12,11 @@
+ 
+ class Borrower(Base):
+     __tablename__ = "borrowers"
+-    __table_args__ = (Index("ix_borrowers_user_id_name", "user_id", "name"),)
++    __table_args__ = (
++        Index("ix_borrowers_user_id_name", "user_id", "name"),
++        # Lets loans reference (id, user_id), so a loan can only use a borrower of the same user.
++        UniqueConstraint("id", "user_id", name="uq_borrowers_id_user_id"),
++    )
+ 
+     id: Mapped[UUIDPk]
+     user_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("users.id", ondelete="CASCADE"))
+@@ -33,13 +37,27 @@
+         CheckConstraint("principal > 0", name="principal_positive"),
+         CheckConstraint("annual_interest_rate >= 0", name="rate_non_negative"),
+         CheckConstraint("maturity_date > start_date", name="maturity_after_start"),
++        CheckConstraint(
++            "repayment_frequency IN ('weekly','biweekly','monthly','quarterly','semiannual','annual')",
++            name="frequency_valid",
++        ),
++        CheckConstraint(
++            "amortization_method IN ('annuity','equal_principal','interest_only')", name="method_valid",
++        ),
++        # active: being repaid; repaid: set automatically when payments cover the schedule; closed: set by hand.
++        CheckConstraint("status IN ('active','repaid','closed')", name="status_valid"),
++        CheckConstraint("length(currency) = 3", name="currency_length"),
++        ForeignKeyConstraint(
++            ["borrower_id", "user_id"], ["borrowers.id", "borrowers.user_id"],
++            ondelete="RESTRICT", name="fk_loans_borrower_same_user",
++        ),
+         Index("ix_loans_user_id_status", "user_id", "status"),
+         Index("ix_loans_borrower_id", "borrower_id"),
+     )
+ 
+     id: Mapped[UUIDPk]
+     user_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("users.id", ondelete="CASCADE"))
+-    borrower_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("borrowers.id", ondelete="RESTRICT"))
++    borrower_id: Mapped[uuid.UUID] = mapped_column(Uuid)  # foreign key: see fk_loans_borrower_same_user
+     principal: Mapped[Money]
+     annual_interest_rate: Mapped[Rate]  # percent, e.g. 7.5 means 7.5% per year
+     currency: Mapped[str] = mapped_column(String(3), server_default="SEK")
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p4/backend/app/services/loan_data.py xvortex/backend/app/services/loan_data.py
+--- a/backend/app/services/loan_data.py	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/app/services/loan_data.py	2026-11-26 23:36:31.898816707 +0100
+@@ -0,0 +1,71 @@
++"""Loads the stored schedule and payments for loans and shapes them for the API."""
++from collections import defaultdict
++from datetime import date
++from decimal import Decimal
++
++from sqlalchemy import select
++from sqlalchemy.orm import Session
++
++from app.api.loan_schemas import InstallmentOut, LoanSummaryOut, RiskOut
++from app.models import Loan, LoanPayment, LoanRepaymentSchedule
++from app.services.loans.amortization import Allocation, Installment, money
++from app.services.loans.risk import RiskAssessment
++from app.services.loans.views import LoanFacts, LoanFigures, compute_figures, installment_status
++
++ZERO = Decimal("0.00")
++
++
++def load_facts(db: Session, loans: list[Loan]) -> list[LoanFacts]:
++    if not loans:
++        return []
++    ids = [loan.id for loan in loans]
++    schedule: dict = defaultdict(list)
++    for r in db.scalars(
++        select(LoanRepaymentSchedule).where(LoanRepaymentSchedule.loan_id.in_(ids))
++        .order_by(LoanRepaymentSchedule.loan_id, LoanRepaymentSchedule.installment_no)
++    ):
++        schedule[r.loan_id].append(Installment(r.installment_no, r.due_date, r.principal_due, r.interest_due))
++    payments: dict = defaultdict(list)
++    for p in db.scalars(select(LoanPayment).where(LoanPayment.loan_id.in_(ids))):
++        payments[p.loan_id].append(p.amount)
++    return [
++        LoanFacts(l.id, l.currency, l.principal, l.status, l.archived_at is not None, schedule[l.id], payments[l.id])
++        for l in loans
++    ]
++
++
++def figures_for(facts: list[LoanFacts], today: date) -> list[tuple[LoanFacts, LoanFigures]]:
++    return [(f, compute_figures(f, today)) for f in facts]
++
++
++def installment_out(a: Allocation, today: date) -> InstallmentOut:
++    i = a.installment
++    return InstallmentOut(
++        number=i.number, due_date=i.due_date, principal=i.principal, interest=i.interest, total=money(i.total),
++        paid_principal=a.paid_principal, paid_interest=a.paid_interest,
++        outstanding=money(a.principal_outstanding + a.interest_outstanding),
++        status=installment_status(a, today),
++    )
++
++
++def risk_out(r: RiskAssessment | None) -> RiskOut | None:
++    return None if r is None else RiskOut(level=r.level, triggers=r.triggers, disclaimer=r.disclaimer)
++
++
++def summary_fields(loan: Loan, borrower_name: str, fig: LoanFigures, risk: RiskAssessment | None) -> dict:
++    nxt = fig.next_due
++    return dict(
++        id=loan.id, borrower_id=loan.borrower_id, borrower_name=borrower_name, principal=loan.principal,
++        annual_interest_rate=loan.annual_interest_rate, currency=loan.currency, start_date=loan.start_date,
++        maturity_date=loan.maturity_date, repayment_frequency=loan.repayment_frequency,
++        amortization_method=loan.amortization_method, status=loan.status, archived=loan.archived_at is not None,
++        outstanding_principal=fig.outstanding_principal, remaining_interest=fig.remaining_interest,
++        overdue_amount=fig.overdue_amount, overdue_installments=len(fig.overdue), unapplied_payments=fig.unapplied,
++        next_due_date=nxt.installment.due_date if nxt else None,
++        next_due_amount=money(nxt.principal_outstanding + nxt.interest_outstanding) if nxt else None,
++        risk=risk_out(risk),
++    )
++
++
++def summary_out(loan: Loan, borrower_name: str, fig: LoanFigures, risk: RiskAssessment | None) -> LoanSummaryOut:
++    return LoanSummaryOut(**summary_fields(loan, borrower_name, fig, risk))
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p4/backend/app/services/loans/views.py xvortex/backend/app/services/loans/views.py
+--- a/backend/app/services/loans/views.py	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/app/services/loans/views.py	2026-11-26 23:35:07.405506746 +0100
+@@ -0,0 +1,105 @@
++"""Per-loan figures for the Loans screens, computed from the stored schedule and payments.
++
++Pure functions over plain data (no database), so every rule here is covered by fast unit tests.
++Nothing is estimated: a loan's numbers come only from its own schedule and recorded payments.
++"""
++from dataclasses import dataclass
++from datetime import date
++from decimal import Decimal
++
++from .amortization import (
++    Allocation, Installment, allocate_payments, money, outstanding_principal, remaining_interest,
++)
++from .risk import RiskAssessment, RiskRules, assess_loan, overdue_installments
++
++ZERO = Decimal("0.00")
++
++
++@dataclass(frozen=True)
++class LoanFacts:
++    loan_id: object
++    currency: str
++    principal: Decimal
++    status: str  # active | repaid | closed
++    archived: bool
++    schedule: list[Installment]
++    payments: list[Decimal]
++
++
++@dataclass(frozen=True)
++class LoanFigures:
++    allocations: list[Allocation]
++    unapplied: Decimal  # paid beyond everything the schedule asks for
++    outstanding_principal: Decimal
++    remaining_interest: Decimal
++    overdue: list[tuple[Allocation, int]]  # (installment, days overdue)
++    overdue_amount: Decimal
++    settled: bool  # every installment fully paid
++    next_due: Allocation | None  # earliest installment not fully paid (may already be overdue)
++
++
++def compute_figures(facts: LoanFacts, today: date) -> LoanFigures:
++    """A loan without a stored schedule falls back to principal minus payments."""
++    if facts.schedule:
++        allocations, unapplied = allocate_payments(facts.schedule, facts.payments)
++        overdue = overdue_installments(allocations, today)
++        return LoanFigures(
++            allocations=allocations,
++            unapplied=money(unapplied),
++            outstanding_principal=money(outstanding_principal(allocations)),
++            remaining_interest=money(remaining_interest(allocations)),
++            overdue=overdue,
++            overdue_amount=money(sum((a.principal_outstanding + a.interest_outstanding for a, _ in overdue), ZERO)),
++            settled=all(a.is_settled for a in allocations),
++            next_due=next((a for a in allocations if not a.is_settled), None),
++        )
++    paid = sum(facts.payments, ZERO)
++    return LoanFigures(
++        allocations=[], unapplied=money(max(paid - facts.principal, ZERO)),
++        outstanding_principal=money(max(facts.principal - paid, ZERO)), remaining_interest=ZERO,
++        overdue=[], overdue_amount=ZERO, settled=paid >= facts.principal, next_due=None,
++    )
++
++
++def installment_status(a: Allocation, today: date) -> str:
++    if a.is_settled:
++        return "paid"
++    if a.installment.due_date < today:
++        return "overdue"
++    if a.paid_principal > 0 or a.paid_interest > 0:
++        return "partial"
++    return "upcoming"
++
++
++def desired_status(current: str, figures: LoanFigures) -> str:
++    """The status after payments change. active and repaid follow the figures automatically; a loan
++    closed by hand stays closed until the user reopens it."""
++    if current == "closed":
++        return current
++    return "repaid" if figures.settled else "active"
++
++
++def assess_all(
++    loans: list[tuple[LoanFacts, LoanFigures]], today: date, rules: RiskRules = RiskRules(),
++) -> dict[object, RiskAssessment]:
++    """Risk for each active, unarchived loan. Concentration compares a loan with the other open loans
++    in its own currency; amounts in different currencies are never added together."""
++    open_loans = [(f, fig) for f, fig in loans if f.status == "active" and not f.archived]
++    outstanding: dict[str, Decimal] = {}
++    counts: dict[str, int] = {}
++    for f, fig in open_loans:
++        outstanding[f.currency] = outstanding.get(f.currency, ZERO) + fig.outstanding_principal
++        counts[f.currency] = counts.get(f.currency, 0) + 1
++    return {
++        f.loan_id: assess_loan(
++            fig.allocations, today, fig.outstanding_principal, outstanding[f.currency], counts[f.currency], rules,
++        )
++        for f, fig in open_loans
++    }
++
++
++def schedule_totals(schedule: list[Installment]) -> tuple[Decimal, Decimal, Decimal]:
++    """(total principal, total interest, total repayable) over the whole schedule."""
++    principal = sum((i.principal for i in schedule), ZERO)
++    interest = sum((i.interest for i in schedule), ZERO)
++    return money(principal), money(interest), money(principal + interest)
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p4/backend/tests/test_loan_schemas.py xvortex/backend/tests/test_loan_schemas.py
+--- a/backend/tests/test_loan_schemas.py	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/tests/test_loan_schemas.py	2026-11-26 23:35:57.558814666 +0100
+@@ -0,0 +1,63 @@
++from datetime import date
++from decimal import Decimal as D
++
++import pytest
++
++pytest.importorskip("pydantic")
++from pydantic import ValidationError  # noqa: E402
++
++from app.api.loan_schemas import BorrowerIn, BorrowerPatch, LoanIn, LoanPatch, PaymentIn  # noqa: E402
++
++BASE = dict(
++    borrower_id="00000000-0000-0000-0000-000000000001", principal="1000.00", annual_interest_rate="7.5",
++    start_date="2026-01-01", maturity_date="2026-12-01",
++)
++
++
++def test_valid_loan_gets_defaults():
++    loan = LoanIn(**BASE)
++    assert loan.currency == "SEK" and loan.repayment_frequency == "monthly" and loan.amortization_method == "annuity"
++    assert loan.principal == D("1000.00")
++
++
++@pytest.mark.parametrize("change", [
++    {"principal": "0"}, {"principal": "-5"}, {"principal": "10.123"}, {"principal": "12345678901234567.00"},
++    {"annual_interest_rate": "-1"}, {"annual_interest_rate": "1000"}, {"annual_interest_rate": "1.00001"},
++    {"currency": "sek"}, {"currency": "SE"}, {"currency": "SEKK"},
++    {"repayment_frequency": "daily"}, {"amortization_method": "balloon"},
++    {"maturity_date": "2026-01-01"}, {"maturity_date": "2025-01-01"},
++])
++def test_invalid_loans_are_rejected(change):
++    with pytest.raises(ValidationError):
++        LoanIn(**{**BASE, **change})
++
++
++def test_borrower_trims_and_clears_blanks():
++    b = BorrowerIn(name="  Anna  ", email="  ", phone="", notes="  ")
++    assert b.name == "Anna" and b.email is None and b.phone is None and b.notes is None
++    with pytest.raises(ValidationError):
++        BorrowerIn(name="   ")
++    with pytest.raises(ValidationError):
++        BorrowerIn(name="A", email="not-an-email")
++
++
++def test_borrower_patch_only_sets_what_is_sent():
++    p = BorrowerPatch(email="")
++    assert p.model_fields_set == {"email"} and p.email is None  # blank clears
++    with pytest.raises(ValidationError):
++        BorrowerPatch(email="bad")
++    with pytest.raises(ValidationError):
++        BorrowerPatch(name=" ")
++
++
++def test_loan_patch_cannot_set_repaid_by_hand():
++    assert LoanPatch(status="closed").status == "closed"
++    with pytest.raises(ValidationError):
++        LoanPatch(status="repaid")
++
++
++def test_payment_rules():
++    assert PaymentIn(paid_on=date(2026, 2, 1), amount="10.50", note=" x ").note == "x"
++    for bad in ("0", "-1", "1.005"):
++        with pytest.raises(ValidationError):
++            PaymentIn(paid_on=date(2026, 2, 1), amount=bad)
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p4/backend/tests/test_loan_views.py xvortex/backend/tests/test_loan_views.py
+--- a/backend/tests/test_loan_views.py	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/tests/test_loan_views.py	2026-11-26 23:35:16.303210170 +0100
+@@ -0,0 +1,95 @@
++from datetime import date
++from decimal import Decimal as D
++
++from app.services.loans.amortization import allocate_payments, build_schedule
++from app.services.loans.views import (
++    LoanFacts, assess_all, compute_figures, desired_status, installment_status, schedule_totals,
++)
++
++TODAY = date(2026, 3, 15)
++
++
++def _facts(loan_id="a", currency="SEK", principal="1200", paid=(), status="active", archived=False,
++           start=date(2026, 1, 1), maturity=date(2026, 7, 1)):
++    schedule = build_schedule(D(principal), D("12"), start, maturity, "monthly", "equal_principal")
++    return LoanFacts(loan_id, currency, D(principal), status, archived, schedule, [D(p) for p in paid])
++
++
++def test_figures_for_an_unpaid_loan_with_two_overdue_installments():
++    fig = compute_figures(_facts(), TODAY)  # Feb 1 and Mar 1 are past due
++    assert fig.outstanding_principal == D("1200.00") and fig.settled is False
++    assert len(fig.overdue) == 2 and fig.overdue_amount == D("422.00")
++    assert fig.next_due.installment.number == 1 and fig.unapplied == D("0.00")
++
++
++def test_payments_move_the_next_due_installment_and_reduce_balances():
++    fig = compute_figures(_facts(paid=["212", "100"]), TODAY)  # installment 1 in full, 100 into installment 2
++    assert fig.outstanding_principal == D("910.00")  # 1200 less 200 (installment 1) less 90 (part of 2)
++    assert fig.next_due.installment.number == 2
++    assert fig.next_due.paid_interest == D("10.00") and fig.next_due.paid_principal == D("90.00")
++    assert len(fig.overdue) == 1  # installment 2 is still partly unpaid and past due
++
++
++def test_loan_is_settled_when_every_installment_is_paid_and_extra_is_reported():
++    s = _facts()
++    total = sum(i.total for i in s.schedule)
++    fig = compute_figures(_facts(paid=[str(total + D("5"))]), TODAY)
++    assert fig.settled and fig.next_due is None and fig.outstanding_principal == D("0.00")
++    assert fig.unapplied == D("5.00")
++
++
++def test_loan_without_schedule_uses_principal_minus_payments():
++    facts = LoanFacts("x", "SEK", D("1000"), "active", False, [], [D("300")])
++    fig = compute_figures(facts, TODAY)
++    assert fig.outstanding_principal == D("700.00") and not fig.settled
++    done = compute_figures(LoanFacts("x", "SEK", D("1000"), "active", False, [], [D("1100")]), TODAY)
++    assert done.settled and done.unapplied == D("100.00")
++
++
++def test_installment_status_labels():
++    s = _facts().schedule
++    allocs, _ = allocate_payments(s, [D("212"), D("50")])
++    labels = [installment_status(a, TODAY) for a in allocs]
++    assert labels[0] == "paid"
++    assert labels[1] == "overdue"  # partly paid but past due
++    assert labels[2] == "upcoming" and labels[-1] == "upcoming"
++    early, _ = allocate_payments(s, [D("50")])
++    assert installment_status(early[0], date(2026, 1, 15)) == "partial"
++
++
++def test_desired_status_follows_payments_but_never_reopens_a_closed_loan():
++    paid_up = compute_figures(_facts(paid=[str(sum(i.total for i in _facts().schedule))]), TODAY)
++    unpaid = compute_figures(_facts(), TODAY)
++    assert desired_status("active", paid_up) == "repaid"
++    assert desired_status("repaid", unpaid) == "active"
++    assert desired_status("closed", paid_up) == "closed" and desired_status("closed", unpaid) == "closed"
++
++
++def test_risk_is_only_for_open_loans_and_concentration_stays_within_a_currency():
++    loans = []
++    for i in range(3):
++        f = _facts(loan_id=f"sek{i}", start=date(2026, 3, 1), maturity=date(2026, 9, 1))
++        loans.append((f, compute_figures(f, TODAY)))
++    usd = _facts(loan_id="usd", currency="USD", principal="50000", start=date(2026, 3, 1), maturity=date(2026, 9, 1))
++    closed = _facts(loan_id="closed", status="closed")
++    archived = _facts(loan_id="arch", archived=True)
++    loans += [(f, compute_figures(f, TODAY)) for f in (usd, closed, archived)]
++    risk = assess_all(loans, TODAY)
++    assert set(risk) == {"sek0", "sek1", "sek2", "usd"}  # no entries for closed or archived loans
++    assert risk["usd"].level == "low"  # alone in its currency: a share of one loan means nothing
++    assert all(risk[f"sek{i}"].level == "low" for i in range(3))  # 33% each, below the 40% flag
++
++
++def test_risk_flags_a_dominant_loan_among_three_and_overdue_loans():
++    big = _facts(loan_id="big", principal="9000", start=date(2026, 3, 1), maturity=date(2026, 9, 1))
++    small = [_facts(loan_id=f"s{i}", principal="500", start=date(2026, 3, 1), maturity=date(2026, 9, 1)) for i in range(2)]
++    late = _facts(loan_id="late", principal="500")  # Feb 1 and Mar 1 unpaid
++    risk = assess_all([(f, compute_figures(f, TODAY)) for f in (big, *small, late)], TODAY)
++    assert risk["big"].level == "medium" and "total outstanding" in risk["big"].triggers[0]
++    assert risk["late"].level == "high"  # Feb 1 installment is 42 days overdue
++    assert risk["s0"].level == "low"
++
++
++def test_schedule_totals():
++    p, i, total = schedule_totals(_facts().schedule)
++    assert p == D("1200.00") and total == p + i and i > 0
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p4/backend/tests/test_loans_api.py xvortex/backend/tests/test_loans_api.py
+--- a/backend/tests/test_loans_api.py	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/tests/test_loans_api.py	2026-11-26 23:37:36.634175422 +0100
+@@ -0,0 +1,194 @@
++"""Borrower, loan and payment endpoints (needs the full dependency set)."""
++from datetime import date, timedelta
++from decimal import Decimal as D
++
++import pytest
++
++pytest.importorskip("fastapi")
++pytest.importorskip("argon2")
++
++from sqlalchemy import select  # noqa: E402
++
++from app.models import AuditLog, Loan, LoanRepaymentSchedule  # noqa: E402
++from tests.helpers import login_csrf  # noqa: E402
++
++START = date.today() - timedelta(days=100)
++MATURITY = START + timedelta(days=180)
++
++
++def _borrower(client, h, name="Anna"):
++    r = client.post("/api/borrowers", json={"name": name}, headers=h)
++    assert r.status_code == 201, r.text
++    return r.json()["id"]
++
++
++def _loan(client, h, borrower_id, **over):
++    body = {
++        "borrower_id": borrower_id, "principal": "1200.00", "annual_interest_rate": "12", "currency": "SEK",
++        "start_date": START.isoformat(), "maturity_date": MATURITY.isoformat(),
++        "repayment_frequency": "monthly", "amortization_method": "equal_principal", **over,
++    }
++    return client.post("/api/loans", json=body, headers=h)
++
++
++def _total(loan) -> D:
++    return sum((D(i["total"]) for i in loan["schedule"]), D("0"))
++
++
++def test_endpoints_need_sign_in_and_csrf(client):
++    for path in ("/api/borrowers", "/api/loans", "/api/loans/00000000-0000-0000-0000-000000000000"):
++        assert client.get(path).status_code == 401
++    h = login_csrf(client)
++    assert client.post("/api/borrowers", json={"name": "x"}).status_code == 403  # no CSRF header
++    assert client.post("/api/borrowers", json={"name": "x"}, headers=h).status_code == 201
++
++
++def test_borrower_create_update_archive(client):
++    h = login_csrf(client)
++    bid = _borrower(client, h)
++    r = client.patch(f"/api/borrowers/{bid}", json={"email": "anna@example.com", "phone": "123"}, headers=h)
++    assert r.json()["email"] == "anna@example.com" and r.json()["name"] == "Anna"
++    assert client.patch(f"/api/borrowers/{bid}", json={"email": ""}, headers=h).json()["email"] is None
++    assert client.patch(f"/api/borrowers/{bid}", json={"email": "bad"}, headers=h).status_code == 422
++    assert client.patch(f"/api/borrowers/{bid}", json={"archived": True}, headers=h).json()["archived"] is True
++    assert client.get("/api/borrowers").json() == []
++    assert len(client.get("/api/borrowers?include_archived=true").json()) == 1
++    assert client.patch(f"/api/borrowers/{bid}", json={"archived": False}, headers=h).json()["archived"] is False
++
++
++def test_preview_does_not_save_anything(client):
++    h = login_csrf(client)
++    body = {
++        "principal": "1200", "annual_interest_rate": "12", "start_date": START.isoformat(),
++        "maturity_date": MATURITY.isoformat(), "repayment_frequency": "monthly", "amortization_method": "annuity",
++    }
++    r = client.post("/api/loans/preview", json=body, headers=h)
++    assert r.status_code == 200
++    out = r.json()
++    assert D(out["total_principal"]) == D("1200.00")
++    assert D(out["total_repayable"]) == D(out["total_principal"]) + D(out["total_interest"])
++    assert len(out["installments"]) == 6
++    assert client.get("/api/loans?view=all").json() == []
++    body["repayment_frequency"] = "weekly"
++    body["maturity_date"] = (START + timedelta(days=365 * 30)).isoformat()
++    assert client.post("/api/loans/preview", json=body, headers=h).status_code == 422  # too many installments
++
++
++def test_create_loan_stores_schedule_and_audits(client):
++    h = login_csrf(client)
++    r = _loan(client, h, _borrower(client, h))
++    assert r.status_code == 201, r.text
++    loan = r.json()
++    assert loan["status"] == "active" and loan["borrower_name"] == "Anna" and len(loan["schedule"]) == 6
++    assert D(loan["outstanding_principal"]) == D("1200.00") and loan["payments"] == []
++    with client.Session() as s:
++        assert len(s.scalars(select(LoanRepaymentSchedule)).all()) == 6
++        assert "loan_created" in s.scalars(select(AuditLog.action)).all()
++
++
++def test_create_loan_validation(client):
++    h = login_csrf(client)
++    bid = _borrower(client, h)
++    assert _loan(client, h, bid, principal="0").status_code == 422
++    assert _loan(client, h, bid, currency="sek").status_code == 422
++    assert _loan(client, h, bid, maturity_date=START.isoformat()).status_code == 422
++    assert _loan(client, h, "00000000-0000-0000-0000-000000000009").status_code == 404
++    client.patch(f"/api/borrowers/{bid}", json={"archived": True}, headers=h)
++    assert _loan(client, h, bid).status_code == 409
++
++
++def test_payments_drive_status_both_ways(client):
++    h = login_csrf(client)
++    loan = _loan(client, h, _borrower(client, h)).json()
++    lid, total = loan["id"], _total(loan)
++
++    r = client.post(f"/api/loans/{lid}/payments", json={"paid_on": START.isoformat(), "amount": "212.00"}, headers=h)
++    assert r.status_code == 201, r.text
++    d = r.json()
++    assert d["status"] == "active" and D(d["outstanding_principal"]) == D("1000.00")
++    assert d["schedule"][0]["status"] == "paid" and D(d["total_paid"]) == D("212.00")
++
++    rest = total - D("212.00")
++    d = client.post(
++        f"/api/loans/{lid}/payments", json={"paid_on": date.today().isoformat(), "amount": str(rest)}, headers=h,
++    ).json()
++    assert d["status"] == "repaid" and D(d["outstanding_principal"]) == D("0.00") and d["next_due_date"] is None
++    assert d["risk"] is None  # only open loans carry a risk rating
++
++    # a repaid loan takes no more payments
++    again = client.post(f"/api/loans/{lid}/payments", json={"paid_on": date.today().isoformat(), "amount": "1"}, headers=h)
++    assert again.status_code == 409
++
++    # deleting a payment reopens it
++    pid = d["payments"][-1]["id"]
++    d = client.delete(f"/api/loans/{lid}/payments/{pid}", headers=h).json()
++    assert d["status"] == "active" and D(d["outstanding_principal"]) > 0
++    assert client.delete(f"/api/loans/{lid}/payments/{pid}", headers=h).status_code == 404
++
++
++def test_payment_date_rules_and_overpayment(client):
++    h = login_csrf(client)
++    loan = _loan(client, h, _borrower(client, h)).json()
++    lid = loan["id"]
++    pay = lambda on, amt: client.post(f"/api/loans/{lid}/payments", json={"paid_on": on, "amount": amt}, headers=h)  # noqa: E731
++    assert pay((START - timedelta(days=1)).isoformat(), "10").status_code == 422
++    assert pay((date.today() + timedelta(days=1)).isoformat(), "10").status_code == 422
++    assert pay(date.today().isoformat(), "0").status_code == 422
++    d = pay(date.today().isoformat(), str(_total(loan) + D("50"))).json()
++    assert d["status"] == "repaid" and D(d["unapplied_payments"]) == D("50.00")
++
++
++def test_closing_archiving_and_reopening(client):
++    h = login_csrf(client)
++    loan = _loan(client, h, _borrower(client, h)).json()
++    lid = loan["id"]
++    assert client.patch(f"/api/loans/{lid}", json={"archived": True}, headers=h).status_code == 409  # still active
++    d = client.patch(f"/api/loans/{lid}", json={"status": "closed", "notes": "written off"}, headers=h).json()
++    assert d["status"] == "closed" and d["notes"] == "written off" and d["risk"] is None
++    assert client.post(f"/api/loans/{lid}/payments", json={"paid_on": date.today().isoformat(), "amount": "5"}, headers=h).status_code == 409
++    assert client.patch(f"/api/loans/{lid}", json={"archived": True}, headers=h).json()["archived"] is True
++    assert client.get("/api/loans?view=active").json() == []
++    assert client.get("/api/loans?view=finished").json() == []
++    assert len(client.get("/api/loans?view=archived").json()) == 1
++    client.patch(f"/api/loans/{lid}", json={"archived": False}, headers=h)
++    assert len(client.get("/api/loans?view=finished").json()) == 1
++    d = client.patch(f"/api/loans/{lid}", json={"status": "active"}, headers=h).json()
++    assert d["status"] == "active"
++    assert client.patch(f"/api/loans/{lid}", json={"status": "repaid"}, headers=h).status_code == 422
++
++
++def test_overdue_loan_is_listed_with_figures_and_risk(client):
++    h = login_csrf(client)
++    _loan(client, h, _borrower(client, h))
++    row = client.get("/api/loans").json()[0]
++    assert row["overdue_installments"] >= 3 and D(row["overdue_amount"]) > 0
++    assert row["risk"]["level"] == "high" and row["risk"]["triggers"]
++    assert row["next_due_date"] < date.today().isoformat()  # the oldest unpaid installment, already late
++
++
++def test_borrower_with_active_loan_cannot_be_archived(client):
++    h = login_csrf(client)
++    bid = _borrower(client, h)
++    lid = _loan(client, h, bid).json()["id"]
++    assert client.patch(f"/api/borrowers/{bid}", json={"archived": True}, headers=h).status_code == 409
++    row = client.get("/api/borrowers").json()[0]
++    assert row["loan_count"] == 1 and row["active_loan_count"] == 1
++    client.patch(f"/api/loans/{lid}", json={"status": "closed"}, headers=h)
++    assert client.patch(f"/api/borrowers/{bid}", json={"archived": True}, headers=h).status_code == 200
++
++
++def test_users_cannot_see_or_change_each_others_loans(client):
++    admin = login_csrf(client)
++    bid = _borrower(client, admin)
++    lid = _loan(client, admin, bid).json()["id"]
++
++    other = login_csrf(client, "user@example.com")
++    assert client.get("/api/loans?view=all").json() == [] and client.get("/api/borrowers").json() == []
++    assert client.get(f"/api/loans/{lid}").status_code == 404
++    assert client.patch(f"/api/loans/{lid}", json={"status": "closed"}, headers=other).status_code == 404
++    assert client.post(f"/api/loans/{lid}/payments", json={"paid_on": date.today().isoformat(), "amount": "5"}, headers=other).status_code == 404
++    assert client.patch(f"/api/borrowers/{bid}", json={"name": "Mine now"}, headers=other).status_code == 404
++    assert _loan(client, other, bid).status_code == 404  # someone else's borrower
++
++    with client.Session() as s:
++        assert s.scalar(select(Loan.status).where(Loan.id == lid)) == "active"
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p4/frontend/src/App.tsx xvortex/frontend/src/App.tsx
+--- a/frontend/src/App.tsx	2026-11-26 23:05:56.000000000 +0100
++++ b/frontend/src/App.tsx	2026-11-26 23:39:06.842515350 +0100
+@@ -6,6 +6,10 @@
+ import Account from "./pages/Account";
+ import Admin from "./pages/Admin";
+ import CommandCenter from "./pages/CommandCenter";
++import Borrowers from "./pages/Borrowers";
++import LoanDetail from "./pages/LoanDetail";
++import Loans from "./pages/Loans";
++import NewLoan from "./pages/NewLoan";
+ import ComingSoon from "./pages/ComingSoon";
+ import Login from "./pages/Login";
+ 
+@@ -38,7 +42,10 @@
+             <Route element={<RequireAuth />}>
+               <Route element={<AppShell />}>
+                 <Route index element={<CommandCenter />} />
+-                <Route path="loans" element={<ComingSoon title="Loans" phase={4}>Borrowers, loans, repayment schedules and payments will be managed here.</ComingSoon>} />
++                <Route path="loans" element={<Loans />} />
++                <Route path="loans/new" element={<NewLoan />} />
++                <Route path="loans/borrowers" element={<Borrowers />} />
++                <Route path="loans/:id" element={<LoanDetail />} />
+                 <Route path="market" element={<ComingSoon title="Market" phase={5}>Watchlists, charts and indicators will appear here, each with a clear data-freshness label.</ComingSoon>} />
+                 <Route path="paper" element={<ComingSoon title="Paper Trading" phase={6}>Simulated orders and positions will live here. No real orders are ever placed.</ComingSoon>} />
+                 <Route path="analytics" element={<ComingSoon title="Analytics" phase={7}>Loan, portfolio and cash-flow reports with CSV and PDF export will be here.</ComingSoon>} />
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p4/frontend/src/components/loans/ScheduleTable.tsx xvortex/frontend/src/components/loans/ScheduleTable.tsx
+--- a/frontend/src/components/loans/ScheduleTable.tsx	1970-01-01 01:00:00.000000000 +0100
++++ b/frontend/src/components/loans/ScheduleTable.tsx	2026-11-26 23:38:11.563339371 +0100
+@@ -0,0 +1,36 @@
++import { formatDate, formatMoney } from "../../lib/format";
++import type { InstallmentRow } from "../../lib/types";
++import { InstallmentBadge } from "./labels";
++
++export function ScheduleTable({ rows, currency, showProgress }: { rows: InstallmentRow[]; currency: string; showProgress: boolean }) {
++  return (
++    <div className="overflow-x-auto">
++      <table className="w-full min-w-[34rem] text-left text-sm">
++        <thead className="text-xs uppercase tracking-wide text-dim">
++          <tr>
++            <th className="py-2 pr-3 font-medium">#</th>
++            <th className="py-2 pr-3 font-medium">Due</th>
++            <th className="py-2 pr-3 text-right font-medium">Principal</th>
++            <th className="py-2 pr-3 text-right font-medium">Interest</th>
++            <th className="py-2 pr-3 text-right font-medium">Total</th>
++            {showProgress && <th className="py-2 pr-3 text-right font-medium">Still owed</th>}
++            {showProgress && <th className="py-2 font-medium">Status</th>}
++          </tr>
++        </thead>
++        <tbody>
++          {rows.map((r) => (
++            <tr key={r.number} className="border-t border-line/15">
++              <td className="py-2 pr-3 num">{r.number}</td>
++              <td className="py-2 pr-3">{formatDate(r.due_date, "UTC")}</td>
++              <td className="py-2 pr-3 text-right num">{formatMoney(r.principal, currency)}</td>
++              <td className="py-2 pr-3 text-right num">{formatMoney(r.interest, currency)}</td>
++              <td className="py-2 pr-3 text-right num">{formatMoney(r.total, currency)}</td>
++              {showProgress && <td className="py-2 pr-3 text-right num">{formatMoney(r.outstanding, currency)}</td>}
++              {showProgress && <td className="py-2"><InstallmentBadge status={r.status} /></td>}
++            </tr>
++          ))}
++        </tbody>
++      </table>
++    </div>
++  );
++}
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p4/frontend/src/components/loans/labels.tsx xvortex/frontend/src/components/loans/labels.tsx
+--- a/frontend/src/components/loans/labels.tsx	1970-01-01 01:00:00.000000000 +0100
++++ b/frontend/src/components/loans/labels.tsx	2026-11-26 23:38:29.720642038 +0100
+@@ -0,0 +1,46 @@
++import type { Frequency, InstallmentStatus, LoanStatus, Method, Risk } from "../../lib/types";
++
++export const FREQUENCY_LABEL: Record<Frequency, string> = {
++  weekly: "Weekly", biweekly: "Every 2 weeks", monthly: "Monthly",
++  quarterly: "Quarterly", semiannual: "Every 6 months", annual: "Yearly",
++};
++
++export const METHOD_LABEL: Record<Method, string> = {
++  annuity: "Equal installments (annuity)",
++  equal_principal: "Equal principal",
++  interest_only: "Interest only, principal at the end",
++};
++
++const STATUS_LABEL: Record<LoanStatus, string> = { active: "Active", repaid: "Repaid", closed: "Closed" };
++
++// Colour is never the only signal: each badge also carries its text.
++const TONE = {
++  good: "border-cyan/40 text-cyan",
++  warn: "border-amber-500/50 text-amber-500",
++  bad: "border-danger/50 text-danger",
++  muted: "border-line/30 text-dim",
++} as const;
++
++function Badge({ tone, children }: { tone: keyof typeof TONE; children: string }) {
++  return <span className={`inline-block rounded-full border px-2 py-0.5 text-xs font-medium ${TONE[tone]}`}>{children}</span>;
++}
++
++export function StatusBadge({ status, archived }: { status: LoanStatus; archived?: boolean }) {
++  if (archived) return <Badge tone="muted">Archived</Badge>;
++  return <Badge tone={status === "active" ? "good" : "muted"}>{STATUS_LABEL[status]}</Badge>;
++}
++
++export function RiskBadge({ risk }: { risk: Risk | null }) {
++  if (!risk) return <span className="text-dim">—</span>;
++  const tone = risk.level === "high" ? "bad" : risk.level === "medium" ? "warn" : "good";
++  return <Badge tone={tone}>{`${risk.level[0].toUpperCase()}${risk.level.slice(1)} risk`}</Badge>;
++}
++
++const INSTALLMENT_LABEL: Record<InstallmentStatus, string> = {
++  paid: "Paid", partial: "Part paid", overdue: "Overdue", upcoming: "Upcoming",
++};
++
++export function InstallmentBadge({ status }: { status: InstallmentStatus }) {
++  const tone = status === "paid" ? "good" : status === "overdue" ? "bad" : status === "partial" ? "warn" : "muted";
++  return <Badge tone={tone}>{INSTALLMENT_LABEL[status]}</Badge>;
++}
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p4/frontend/src/lib/types.ts xvortex/frontend/src/lib/types.ts
+--- a/frontend/src/lib/types.ts	2026-11-26 22:47:00.000000000 +0100
++++ b/frontend/src/lib/types.ts	2026-11-26 23:38:11.554822631 +0100
+@@ -55,3 +55,75 @@
+   news: { status: string; items: unknown[] };
+   notifications: { unread: number; latest: AppNotification[] };
+ }
++
++// ---- Loans (phase 4). Amounts are decimal strings; dates are YYYY-MM-DD. ----
++export type Frequency = "weekly" | "biweekly" | "monthly" | "quarterly" | "semiannual" | "annual";
++export type Method = "annuity" | "equal_principal" | "interest_only";
++export type LoanStatus = "active" | "repaid" | "closed";
++export type InstallmentStatus = "paid" | "partial" | "overdue" | "upcoming";
++
++export interface Borrower {
++  id: string;
++  name: string;
++  email: string | null;
++  phone: string | null;
++  notes: string | null;
++  archived: boolean;
++  loan_count: number;
++  active_loan_count: number;
++  created_at: string;
++}
++
++export interface Risk { level: "low" | "medium" | "high"; triggers: string[]; disclaimer: string }
++
++export interface InstallmentRow {
++  number: number;
++  due_date: string;
++  principal: string;
++  interest: string;
++  total: string;
++  paid_principal: string;
++  paid_interest: string;
++  outstanding: string;
++  status: InstallmentStatus;
++}
++
++export interface LoanSummary {
++  id: string;
++  borrower_id: string;
++  borrower_name: string;
++  principal: string;
++  annual_interest_rate: string;
++  currency: string;
++  start_date: string;
++  maturity_date: string;
++  repayment_frequency: Frequency;
++  amortization_method: Method;
++  status: LoanStatus;
++  archived: boolean;
++  outstanding_principal: string;
++  remaining_interest: string;
++  overdue_amount: string;
++  overdue_installments: number;
++  unapplied_payments: string;
++  next_due_date: string | null;
++  next_due_amount: string | null;
++  risk: Risk | null;
++}
++
++export interface LoanPaymentRow { id: string; paid_on: string; amount: string; note: string | null }
++
++export interface LoanDetail extends LoanSummary {
++  notes: string | null;
++  created_at: string;
++  total_paid: string;
++  schedule: InstallmentRow[];
++  payments: LoanPaymentRow[];
++}
++
++export interface LoanPreview {
++  installments: InstallmentRow[];
++  total_principal: string;
++  total_interest: string;
++  total_repayable: string;
++}
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p4/frontend/src/pages/Borrowers.tsx xvortex/frontend/src/pages/Borrowers.tsx
+--- a/frontend/src/pages/Borrowers.tsx	1970-01-01 01:00:00.000000000 +0100
++++ b/frontend/src/pages/Borrowers.tsx	2026-11-26 23:38:29.722023227 +0100
+@@ -0,0 +1,130 @@
++import { useState, type FormEvent } from "react";
++import { Link } from "react-router-dom";
++import { ArrowLeft, Loader2 } from "lucide-react";
++import { Field } from "../components/ui/Field";
++import { api, ApiError } from "../lib/api";
++import type { Borrower } from "../lib/types";
++import { useApi } from "../lib/useApi";
++
++const message = (e: unknown) => (e instanceof ApiError ? e.message : "Something went wrong. Try again.");
++
++function BorrowerForm({
++  initial, submitLabel, onSubmit, onCancel,
++}: {
++  initial?: Borrower;
++  submitLabel: string;
++  onSubmit: (v: { name: string; email: string; phone: string; notes: string }) => Promise<void>;
++  onCancel?: () => void;
++}) {
++  const [name, setName] = useState(initial?.name ?? "");
++  const [email, setEmail] = useState(initial?.email ?? "");
++  const [phone, setPhone] = useState(initial?.phone ?? "");
++  const [notes, setNotes] = useState(initial?.notes ?? "");
++  const [busy, setBusy] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++
++  async function submit(e: FormEvent) {
++    e.preventDefault();
++    setBusy(true);
++    setError(null);
++    try {
++      await onSubmit({ name, email, phone, notes });
++      if (!initial) { setName(""); setEmail(""); setPhone(""); setNotes(""); }
++    } catch (err) {
++      setError(message(err));
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  return (
++    <form onSubmit={(e) => void submit(e)} className="grid gap-4 sm:grid-cols-2">
++      <Field label="Name" required maxLength={200} value={name} onChange={(e) => setName(e.target.value)} />
++      <Field label="Email (optional)" type="email" maxLength={320} value={email} onChange={(e) => setEmail(e.target.value)} />
++      <Field label="Phone (optional)" maxLength={50} value={phone} onChange={(e) => setPhone(e.target.value)} />
++      <Field label="Notes (optional)" maxLength={5000} value={notes} onChange={(e) => setNotes(e.target.value)} />
++      {error && <p role="alert" className="text-sm text-danger sm:col-span-2">{error}</p>}
++      <div className="flex gap-2 sm:col-span-2">
++        <button className="btn btn-primary" disabled={busy || !name.trim()}>
++          {busy && <Loader2 className="h-4 w-4 animate-spin" aria-hidden />}{submitLabel}
++        </button>
++        {onCancel && <button type="button" className="btn btn-ghost" onClick={onCancel}>Cancel</button>}
++      </div>
++    </form>
++  );
++}
++
++export default function Borrowers() {
++  const [showArchived, setShowArchived] = useState(false);
++  const { data, error, loading, reload } = useApi<Borrower[]>(`/api/borrowers?include_archived=${showArchived}`);
++  const [editing, setEditing] = useState<string | null>(null);
++  const [actionError, setActionError] = useState<string | null>(null);
++
++  async function add(v: { name: string; email: string; phone: string; notes: string }) {
++    await api("/api/borrowers", { method: "POST", body: v });
++    reload();
++  }
++
++  async function patch(id: string, body: Record<string, unknown>) {
++    setActionError(null);
++    try {
++      await api(`/api/borrowers/${id}`, { method: "PATCH", body });
++      setEditing(null);
++      reload();
++    } catch (err) {
++      setActionError(message(err));
++      throw err;
++    }
++  }
++
++  return (
++    <section>
++      <Link to="/loans" className="inline-flex items-center gap-1 text-sm text-dim hover:text-fg">
++        <ArrowLeft className="h-4 w-4" aria-hidden />Loans
++      </Link>
++      <h1 className="mt-2 text-2xl font-semibold">Borrowers</h1>
++
++      <div className="glass mt-6 rounded-2xl p-6">
++        <h2 className="mb-4 font-semibold">Add a borrower</h2>
++        <BorrowerForm submitLabel="Add borrower" onSubmit={add} />
++      </div>
++
++      <label className="mt-6 flex items-center gap-2 text-sm">
++        <input type="checkbox" checked={showArchived} onChange={(e) => setShowArchived(e.target.checked)} />
++        Show archived borrowers
++      </label>
++      {error && <p role="alert" className="mt-4 text-sm text-danger">{error}</p>}
++      {actionError && <p role="alert" className="mt-4 text-sm text-danger">{actionError}</p>}
++      {loading && !data && <p className="mt-4 text-sm text-dim" role="status">Loading…</p>}
++      {data && data.length === 0 && <p className="mt-4 text-sm text-dim">No borrowers yet.</p>}
++
++      <ul className="mt-4 space-y-3">
++        {data?.map((b) => (
++          <li key={b.id} className="glass rounded-2xl p-5">
++            {editing === b.id ? (
++              <BorrowerForm initial={b} submitLabel="Save"
++                onSubmit={(v) => patch(b.id, v)} onCancel={() => setEditing(null)} />
++            ) : (
++              <div className="flex flex-wrap items-start justify-between gap-3">
++                <div>
++                  <p className="font-medium">{b.name}{b.archived && <span className="ml-2 text-xs text-dim">(archived)</span>}</p>
++                  <p className="text-sm text-dim">
++                    {[b.email, b.phone].filter(Boolean).join(" · ") || "No contact details"}
++                  </p>
++                  {b.notes && <p className="mt-1 text-sm">{b.notes}</p>}
++                  <p className="mt-1 text-xs text-dim">{b.loan_count} loan{b.loan_count === 1 ? "" : "s"}, {b.active_loan_count} active</p>
++                </div>
++                <div className="flex gap-2">
++                  <button className="btn btn-ghost" onClick={() => setEditing(b.id)}>Edit</button>
++                  <button className="btn btn-ghost" onClick={() => void patch(b.id, { archived: !b.archived }).catch(() => undefined)}>
++                    {b.archived ? "Restore" : "Archive"}
++                  </button>
++                </div>
++              </div>
++            )}
++          </li>
++        ))}
++      </ul>
++    </section>
++  );
++}
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p4/frontend/src/pages/LoanDetail.tsx xvortex/frontend/src/pages/LoanDetail.tsx
+--- a/frontend/src/pages/LoanDetail.tsx	1970-01-01 01:00:00.000000000 +0100
++++ b/frontend/src/pages/LoanDetail.tsx	2026-11-26 23:39:06.820706658 +0100
+@@ -0,0 +1,187 @@
++import { useEffect, useState, type FormEvent } from "react";
++import { Link, useParams } from "react-router-dom";
++import { ArrowLeft, Loader2, Trash2 } from "lucide-react";
++import { FREQUENCY_LABEL, METHOD_LABEL, RiskBadge, StatusBadge } from "../components/loans/labels";
++import { ScheduleTable } from "../components/loans/ScheduleTable";
++import { Field } from "../components/ui/Field";
++import { api, ApiError } from "../lib/api";
++import { formatDate, formatMoney } from "../lib/format";
++import type { LoanDetail as Loan } from "../lib/types";
++import { useApi } from "../lib/useApi";
++
++const today = () => new Date().toISOString().slice(0, 10);
++const message = (e: unknown) => (e instanceof ApiError ? e.message : "Something went wrong. Try again.");
++
++function Stat({ label, value, tone }: { label: string; value: string; tone?: "bad" }) {
++  return (
++    <div className="glass rounded-2xl p-4">
++      <p className="text-xs uppercase tracking-wide text-dim">{label}</p>
++      <p className={`mt-1 text-lg num ${tone === "bad" ? "text-danger" : ""}`}>{value}</p>
++    </div>
++  );
++}
++
++export default function LoanDetail() {
++  const { id = "" } = useParams();
++  const { data, error, loading, reload } = useApi<Loan>(`/api/loans/${id}`);
++  // After a change the server returns the fresh loan, which replaces what useApi loaded.
++  const [loan, setLoan] = useState<Loan | null>(null);
++  useEffect(() => { if (data) setLoan(data); }, [data]);
++
++  const [paidOn, setPaidOn] = useState(today());
++  const [amount, setAmount] = useState("");
++  const [note, setNote] = useState("");
++  const [notes, setNotes] = useState<string | null>(null);
++  const [busy, setBusy] = useState(false);
++  const [actionError, setActionError] = useState<string | null>(null);
++
++  async function run(fn: () => Promise<Loan>): Promise<boolean> {
++    setBusy(true);
++    setActionError(null);
++    try {
++      setLoan(await fn());
++      return true;
++    } catch (err) {
++      setActionError(message(err));
++      if (err instanceof ApiError && err.status === 404) reload();
++      return false;
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  const patch = (body: Record<string, unknown>) => run(() => api<Loan>(`/api/loans/${id}`, { method: "PATCH", body }));
++
++  async function addPayment(e: FormEvent) {
++    e.preventDefault();
++    const ok = await run(() => api<Loan>(`/api/loans/${id}/payments`, {
++      method: "POST", body: { paid_on: paidOn, amount, note },
++    }));
++    if (ok) { setAmount(""); setNote(""); }
++  }
++
++  async function removePayment(paymentId: string, label: string) {
++    if (!window.confirm(`Delete the payment of ${label}? Balances and the loan status are recalculated.`)) return;
++    await run(() => api<Loan>(`/api/loans/${id}/payments/${paymentId}`, { method: "DELETE" }));
++  }
++
++  if (error && !loan) {
++    return (
++      <section>
++        <Link to="/loans" className="text-sm text-dim hover:text-fg">Back to loans</Link>
++        <p role="alert" className="mt-4 text-sm text-danger">{error}</p>
++      </section>
++    );
++  }
++  if (!loan) return <p className="text-sm text-dim" role="status">{loading ? "Loading loan…" : ""}</p>;
++
++  const cur = loan.currency;
++  const canPay = loan.status === "active";
++  const notesDirty = notes !== null && notes !== (loan.notes ?? "");
++
++  return (
++    <section>
++      <Link to="/loans" className="inline-flex items-center gap-1 text-sm text-dim hover:text-fg">
++        <ArrowLeft className="h-4 w-4" aria-hidden />Loans
++      </Link>
++      <div className="mt-2 flex flex-wrap items-center gap-3">
++        <h1 className="text-2xl font-semibold">{loan.borrower_name}</h1>
++        <StatusBadge status={loan.status} archived={loan.archived} />
++        <RiskBadge risk={loan.risk} />
++      </div>
++      <p className="mt-1 text-sm text-dim">
++        {formatMoney(loan.principal, cur)} at {Number(loan.annual_interest_rate)}% a year · {FREQUENCY_LABEL[loan.repayment_frequency]} ·{" "}
++        {METHOD_LABEL[loan.amortization_method]} · {formatDate(loan.start_date, "UTC")} to {formatDate(loan.maturity_date, "UTC")}
++      </p>
++
++      {actionError && <p role="alert" className="mt-4 text-sm text-danger">{actionError}</p>}
++
++      <div className="mt-6 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
++        <Stat label="Principal outstanding" value={formatMoney(loan.outstanding_principal, cur)} />
++        <Stat label="Interest still to come" value={formatMoney(loan.remaining_interest, cur)} />
++        <Stat label="Paid so far" value={formatMoney(loan.total_paid, cur)} />
++        <Stat label="Overdue" value={loan.overdue_installments ? `${formatMoney(loan.overdue_amount, cur)} (${loan.overdue_installments})` : "None"}
++          tone={loan.overdue_installments ? "bad" : undefined} />
++      </div>
++      {Number(loan.unapplied_payments) > 0 && (
++        <p className="mt-3 text-sm text-dim">Paid beyond the schedule: {formatMoney(loan.unapplied_payments, cur)}.</p>
++      )}
++
++      {loan.risk && loan.risk.triggers.length > 0 && (
++        <div className="glass mt-6 rounded-2xl p-5">
++          <h2 className="font-semibold">Why this loan is flagged</h2>
++          <ul className="mt-2 list-disc space-y-1 pl-5 text-sm">{loan.risk.triggers.map((t) => <li key={t}>{t}</li>)}</ul>
++          <p className="mt-3 text-xs text-dim">{loan.risk.disclaimer}</p>
++        </div>
++      )}
++
++      <div className="glass mt-6 rounded-2xl p-6">
++        <h2 className="font-semibold">Payments</h2>
++        {canPay ? (
++          <form onSubmit={(e) => void addPayment(e)} className="mt-4 grid gap-4 sm:grid-cols-4">
++            <Field label="Date received" type="date" required min={loan.start_date} max={today()} value={paidOn} onChange={(e) => setPaidOn(e.target.value)} />
++            <Field label="Amount" required inputMode="decimal" pattern="[0-9]+([.][0-9]{1,2})?" value={amount} onChange={(e) => setAmount(e.target.value)} />
++            <Field label="Note (optional)" maxLength={500} value={note} onChange={(e) => setNote(e.target.value)} />
++            <div className="flex items-end">
++              <button className="btn btn-primary w-full" disabled={busy || !amount || !paidOn}>
++                {busy && <Loader2 className="h-4 w-4 animate-spin" aria-hidden />}Record payment
++              </button>
++            </div>
++          </form>
++        ) : (
++          <p className="mt-2 text-sm text-dim">Payments can only be recorded on active loans.</p>
++        )}
++        {loan.payments.length === 0 ? (
++          <p className="mt-4 text-sm text-dim">No payments recorded yet.</p>
++        ) : (
++          <ul className="mt-4 divide-y divide-line/15 text-sm">
++            {loan.payments.map((p) => {
++              const label = formatMoney(p.amount, cur);
++              return (
++                <li key={p.id} className="flex items-center justify-between gap-3 py-2">
++                  <span>{formatDate(p.paid_on, "UTC")}{p.note && <span className="ml-2 text-dim">{p.note}</span>}</span>
++                  <span className="flex items-center gap-3">
++                    <span className="num">{label}</span>
++                    <button className="text-dim hover:text-danger" aria-label={`Delete payment of ${label} on ${formatDate(p.paid_on, "UTC")}`}
++                      disabled={busy} onClick={() => void removePayment(p.id, label)}>
++                      <Trash2 className="h-4 w-4" aria-hidden />
++                    </button>
++                  </span>
++                </li>
++              );
++            })}
++          </ul>
++        )}
++      </div>
++
++      <div className="glass mt-6 rounded-2xl p-6">
++        <h2 className="font-semibold">Schedule</h2>
++        <div className="mt-3"><ScheduleTable rows={loan.schedule} currency={cur} showProgress /></div>
++        <p className="mt-3 text-xs text-dim">
++          Payments are applied to the oldest unpaid installment first, interest before principal. Remaining interest is not
++          recalculated after an early repayment.
++        </p>
++      </div>
++
++      <div className="glass mt-6 rounded-2xl p-6">
++        <h2 className="font-semibold">Notes and status</h2>
++        <label htmlFor="loan-notes" className="sr-only">Notes</label>
++        <textarea id="loan-notes" className="field mt-3 min-h-24" maxLength={5000}
++          value={notes ?? loan.notes ?? ""} onChange={(e) => setNotes(e.target.value)} />
++        <div className="mt-3 flex flex-wrap gap-2">
++          <button className="btn btn-ghost" disabled={busy || !notesDirty}
++            onClick={() => void patch({ notes: notes ?? "" }).then((ok) => ok && setNotes(null))}>Save notes</button>
++          {loan.status !== "closed" && (
++            <button className="btn btn-ghost" disabled={busy}
++              onClick={() => window.confirm("Close this loan? No more payments can be recorded until you reopen it.") && void patch({ status: "closed" })}>
++              Close loan
++            </button>
++          )}
++          {loan.status === "closed" && <button className="btn btn-ghost" disabled={busy} onClick={() => void patch({ status: "active" })}>Reopen loan</button>}
++          {loan.status !== "active" && !loan.archived && <button className="btn btn-ghost" disabled={busy} onClick={() => void patch({ archived: true })}>Archive</button>}
++          {loan.archived && <button className="btn btn-ghost" disabled={busy} onClick={() => void patch({ archived: false })}>Restore from archive</button>}
++        </div>
++      </div>
++    </section>
++  );
++}
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p4/frontend/src/pages/Loans.tsx xvortex/frontend/src/pages/Loans.tsx
+--- a/frontend/src/pages/Loans.tsx	1970-01-01 01:00:00.000000000 +0100
++++ b/frontend/src/pages/Loans.tsx	2026-11-26 23:38:11.564565347 +0100
+@@ -0,0 +1,93 @@
++import { useState } from "react";
++import { Link } from "react-router-dom";
++import { Plus, Users } from "lucide-react";
++import { RiskBadge, StatusBadge } from "../components/loans/labels";
++import { formatDate, formatMoney } from "../lib/format";
++import type { LoanSummary } from "../lib/types";
++import { useApi } from "../lib/useApi";
++
++const VIEWS = [
++  { id: "active", label: "Active" },
++  { id: "finished", label: "Repaid and closed" },
++  { id: "archived", label: "Archived" },
++] as const;
++
++type View = (typeof VIEWS)[number]["id"];
++
++export default function Loans() {
++  const [view, setView] = useState<View>("active");
++  const { data, error, loading } = useApi<LoanSummary[]>(`/api/loans?view=${view}`);
++
++  return (
++    <section>
++      <div className="flex flex-wrap items-center justify-between gap-3">
++        <h1 className="text-2xl font-semibold">Loans</h1>
++        <div className="flex gap-2">
++          <Link to="/loans/borrowers" className="btn btn-ghost"><Users className="h-4 w-4" aria-hidden />Borrowers</Link>
++          <Link to="/loans/new" className="btn btn-primary"><Plus className="h-4 w-4" aria-hidden />New loan</Link>
++        </div>
++      </div>
++
++      <div role="tablist" aria-label="Loan view" className="mt-5 flex gap-1 border-b border-line/20">
++        {VIEWS.map((v) => (
++          <button key={v.id} role="tab" aria-selected={view === v.id} onClick={() => setView(v.id)}
++            className={`-mb-px border-b-2 px-3 py-2 text-sm ${view === v.id ? "border-cyan text-fg" : "border-transparent text-dim hover:text-fg"}`}>
++            {v.label}
++          </button>
++        ))}
++      </div>
++
++      {error && <p role="alert" className="mt-6 text-sm text-danger">{error}</p>}
++      {loading && !data && <p className="mt-6 text-sm text-dim" role="status">Loading loans…</p>}
++      {data && data.length === 0 && (
++        <div className="glass mt-6 rounded-2xl p-6 text-sm text-dim">
++          {view === "active"
++            ? <>No active loans yet. <Link to="/loans/new" className="text-cyan underline">Add your first loan</Link>; you will need a borrower first.</>
++            : "Nothing here."}
++        </div>
++      )}
++      {data && data.length > 0 && (
++        <div className="glass mt-6 overflow-x-auto rounded-2xl p-2">
++          <table className="w-full min-w-[46rem] text-left text-sm">
++            <thead className="text-xs uppercase tracking-wide text-dim">
++              <tr>
++                <th className="px-3 py-2 font-medium">Borrower</th>
++                <th className="px-3 py-2 text-right font-medium">Principal</th>
++                <th className="px-3 py-2 text-right font-medium">Outstanding</th>
++                <th className="px-3 py-2 font-medium">Next payment</th>
++                <th className="px-3 py-2 font-medium">Status</th>
++                <th className="px-3 py-2 font-medium">Risk</th>
++              </tr>
++            </thead>
++            <tbody>
++              {data.map((l) => (
++                <tr key={l.id} className="border-t border-line/15 hover:bg-line/5">
++                  <td className="px-3 py-3">
++                    <Link to={`/loans/${l.id}`} className="font-medium text-cyan hover:underline">{l.borrower_name}</Link>
++                    <div className="text-xs text-dim">{formatDate(l.start_date, "UTC")} to {formatDate(l.maturity_date, "UTC")}</div>
++                  </td>
++                  <td className="px-3 py-3 text-right num">{formatMoney(l.principal, l.currency)}</td>
++                  <td className="px-3 py-3 text-right num">{formatMoney(l.outstanding_principal, l.currency)}</td>
++                  <td className="px-3 py-3">
++                    {l.next_due_date && l.next_due_amount ? (
++                      <>
++                        <span className="num">{formatMoney(l.next_due_amount, l.currency)}</span>
++                        <div className="text-xs text-dim">{formatDate(l.next_due_date, "UTC")}</div>
++                      </>
++                    ) : <span className="text-dim">—</span>}
++                    {l.overdue_installments > 0 && (
++                      <div className="text-xs text-danger">{l.overdue_installments} overdue · {formatMoney(l.overdue_amount, l.currency)}</div>
++                    )}
++                  </td>
++                  <td className="px-3 py-3"><StatusBadge status={l.status} archived={l.archived} /></td>
++                  <td className="px-3 py-3"><RiskBadge risk={l.risk} /></td>
++                </tr>
++              ))}
++            </tbody>
++          </table>
++        </div>
++      )}
++      <p className="mt-4 text-xs text-dim">Amounts in different currencies are never added together.</p>
++    </section>
++  );
++}
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p4/frontend/src/pages/NewLoan.tsx xvortex/frontend/src/pages/NewLoan.tsx
+--- a/frontend/src/pages/NewLoan.tsx	1970-01-01 01:00:00.000000000 +0100
++++ b/frontend/src/pages/NewLoan.tsx	2026-11-26 23:39:06.819448691 +0100
+@@ -0,0 +1,147 @@
++import { useMemo, useState, type FormEvent } from "react";
++import { Link, useNavigate } from "react-router-dom";
++import { ArrowLeft, Loader2 } from "lucide-react";
++import { FREQUENCY_LABEL, METHOD_LABEL } from "../components/loans/labels";
++import { ScheduleTable } from "../components/loans/ScheduleTable";
++import { Field } from "../components/ui/Field";
++import { api, ApiError } from "../lib/api";
++import { formatMoney } from "../lib/format";
++import type { Borrower, Frequency, LoanDetail, LoanPreview, Method } from "../lib/types";
++import { useApi } from "../lib/useApi";
++
++const today = () => new Date().toISOString().slice(0, 10);
++
++export default function NewLoan() {
++  const navigate = useNavigate();
++  const { data: borrowers, error: loadError } = useApi<Borrower[]>("/api/borrowers");
++  const [borrowerId, setBorrowerId] = useState("");
++  const [principal, setPrincipal] = useState("");
++  const [rate, setRate] = useState("");
++  const [currency, setCurrency] = useState("SEK");
++  const [start, setStart] = useState(today());
++  const [maturity, setMaturity] = useState("");
++  const [frequency, setFrequency] = useState<Frequency>("monthly");
++  const [method, setMethod] = useState<Method>("annuity");
++  const [notes, setNotes] = useState("");
++  const [preview, setPreview] = useState<LoanPreview | null>(null);
++  const [previewKey, setPreviewKey] = useState("");
++  const [busy, setBusy] = useState<"preview" | "save" | null>(null);
++  const [error, setError] = useState<string | null>(null);
++
++  const terms = useMemo(() => ({
++    principal, annual_interest_rate: rate, currency: currency.toUpperCase(), start_date: start, maturity_date: maturity,
++    repayment_frequency: frequency, amortization_method: method,
++  }), [principal, rate, currency, start, maturity, frequency, method]);
++  const termsKey = JSON.stringify(terms);
++  const complete = Boolean(principal && rate !== "" && start && maturity && currency.length === 3);
++  // A preview only counts while the form still matches it.
++  const previewIsCurrent = preview !== null && previewKey === termsKey;
++
++  async function runPreview() {
++    setBusy("preview");
++    setError(null);
++    try {
++      setPreview(await api<LoanPreview>("/api/loans/preview", { method: "POST", body: terms }));
++      setPreviewKey(termsKey);
++    } catch (err) {
++      setPreview(null);
++      setError(err instanceof ApiError ? err.message : "Could not build the schedule.");
++    } finally {
++      setBusy(null);
++    }
++  }
++
++  async function save(e: FormEvent) {
++    e.preventDefault();
++    if (!previewIsCurrent) { await runPreview(); return; }
++    setBusy("save");
++    setError(null);
++    try {
++      const loan = await api<LoanDetail>("/api/loans", { method: "POST", body: { ...terms, borrower_id: borrowerId, notes } });
++      navigate(`/loans/${loan.id}`);
++    } catch (err) {
++      setError(err instanceof ApiError ? err.message : "Could not save the loan.");
++      setBusy(null);
++    }
++  }
++
++  return (
++    <section>
++      <Link to="/loans" className="inline-flex items-center gap-1 text-sm text-dim hover:text-fg">
++        <ArrowLeft className="h-4 w-4" aria-hidden />Loans
++      </Link>
++      <h1 className="mt-2 text-2xl font-semibold">New loan</h1>
++
++      {loadError && <p role="alert" className="mt-4 text-sm text-danger">{loadError}</p>}
++      {borrowers && borrowers.length === 0 && (
++        <p className="glass mt-6 rounded-2xl p-6 text-sm">
++          You need a borrower first. <Link to="/loans/borrowers" className="text-cyan underline">Add one</Link>, then come back.
++        </p>
++      )}
++
++      {borrowers && borrowers.length > 0 && (
++        <form onSubmit={(e) => void save(e)} className="glass mt-6 rounded-2xl p-6">
++          <div className="grid gap-4 sm:grid-cols-2">
++            <div>
++              <label htmlFor="borrower" className="mb-1.5 block text-sm font-medium">Borrower</label>
++              <select id="borrower" className="field" required value={borrowerId} onChange={(e) => setBorrowerId(e.target.value)}>
++                <option value="">Choose a borrower</option>
++                {borrowers.map((b) => <option key={b.id} value={b.id}>{b.name}</option>)}
++              </select>
++            </div>
++            <Field label="Currency" required maxLength={3} minLength={3} pattern="[A-Za-z]{3}" hint="Three letters, for example SEK or USD."
++              value={currency} onChange={(e) => setCurrency(e.target.value.toUpperCase())} />
++            <Field label="Amount lent" required inputMode="decimal" pattern="[0-9]+([.][0-9]{1,2})?" hint="Up to two decimals."
++              value={principal} onChange={(e) => setPrincipal(e.target.value)} />
++            <Field label="Yearly interest rate (%)" required inputMode="decimal" pattern="[0-9]+([.][0-9]{1,4})?"
++              hint="0 for an interest-free loan."
++              value={rate} onChange={(e) => setRate(e.target.value)} />
++            <Field label="Start date" type="date" required value={start} onChange={(e) => setStart(e.target.value)} />
++            <Field label="Final payment date" type="date" required min={start} value={maturity} onChange={(e) => setMaturity(e.target.value)} />
++            <div>
++              <label htmlFor="frequency" className="mb-1.5 block text-sm font-medium">Repayment frequency</label>
++              <select id="frequency" className="field" value={frequency} onChange={(e) => setFrequency(e.target.value as Frequency)}>
++                {(Object.keys(FREQUENCY_LABEL) as Frequency[]).map((f) => <option key={f} value={f}>{FREQUENCY_LABEL[f]}</option>)}
++              </select>
++            </div>
++            <div>
++              <label htmlFor="method" className="mb-1.5 block text-sm font-medium">Repayment method</label>
++              <select id="method" className="field" value={method} onChange={(e) => setMethod(e.target.value as Method)}>
++                {(Object.keys(METHOD_LABEL) as Method[]).map((m) => <option key={m} value={m}>{METHOD_LABEL[m]}</option>)}
++              </select>
++            </div>
++            <Field className="sm:col-span-2" label="Notes (optional)" maxLength={5000} value={notes} onChange={(e) => setNotes(e.target.value)} />
++          </div>
++
++          {error && <p role="alert" className="mt-4 text-sm text-danger">{error}</p>}
++          <div className="mt-6 flex flex-wrap gap-2">
++            <button type="button" className="btn btn-ghost" disabled={!complete || busy !== null} onClick={() => void runPreview()}>
++              {busy === "preview" && <Loader2 className="h-4 w-4 animate-spin" aria-hidden />}Preview schedule
++            </button>
++            <button className="btn btn-primary" disabled={!complete || !borrowerId || busy !== null}>
++              {busy === "save" && <Loader2 className="h-4 w-4 animate-spin" aria-hidden />}
++              {previewIsCurrent ? "Save loan" : "Preview, then save"}
++            </button>
++          </div>
++        </form>
++      )}
++
++      {preview && (
++        <div className="glass mt-6 rounded-2xl p-6" aria-live="polite">
++          <h2 className="font-semibold">Repayment schedule</h2>
++          {!previewIsCurrent && <p className="mt-1 text-sm text-amber-500">The form changed since this preview. Preview again before saving.</p>}
++          <dl className="mt-3 grid gap-3 text-sm sm:grid-cols-3">
++            <div><dt className="text-dim">Principal</dt><dd className="num">{formatMoney(preview.total_principal, currency)}</dd></div>
++            <div><dt className="text-dim">Total interest</dt><dd className="num">{formatMoney(preview.total_interest, currency)}</dd></div>
++            <div><dt className="text-dim">Total to be repaid</dt><dd className="num">{formatMoney(preview.total_repayable, currency)}</dd></div>
++          </dl>
++          <div className="mt-4"><ScheduleTable rows={preview.installments} currency={currency} showProgress={false} /></div>
++          <p className="mt-3 text-xs text-dim">
++            Interest uses the yearly rate divided by the number of periods per year. Early repayments reduce what is owed on the
++            oldest installments; the schedule is not recalculated.
++          </p>
++        </div>
++      )}
++    </section>
++  );
++}
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p4/frontend/tailwind.config.js xvortex/frontend/tailwind.config.js
+--- a/frontend/tailwind.config.js	2026-11-24 02:53:02.000000000 +0100
++++ b/frontend/tailwind.config.js	2026-11-26 23:38:29.715874230 +0100
+@@ -7,7 +7,7 @@
+     extend: {
+       colors: {
+         ink: c("ink"), panel: c("panel"), fg: c("fg"), dim: c("dim"),
+-        cyan: c("cyan"), azure: c("azure"), violet: c("violet"), danger: c("danger"),
++        cyan: c("cyan"), azure: c("azure"), violet: c("violet"), danger: c("danger"), line: c("line"),
+       },
+       fontFamily: {
+         sans: ["Sora", "system-ui", "sans-serif"],

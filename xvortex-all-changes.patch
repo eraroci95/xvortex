@@ -1,0 +1,1807 @@
+diff --git a/.env.example b/.env.example
+index 1b133dd..4ecea30 100644
+--- a/.env.example
++++ b/.env.example
+@@ -1,4 +1,5 @@
+ # Copy to backend/.env for local development. NEVER commit real values.
++# Unset means production. Local development needs development.
+ ENVIRONMENT=development
+ # Neon connection string (Dashboard > Connection details). Keep sslmode=require.
+ DATABASE_URL=postgresql://USER:PASSWORD@HOST/DBNAME?sslmode=require
+@@ -6,6 +7,10 @@ DATABASE_URL=postgresql://USER:PASSWORD@HOST/DBNAME?sslmode=require
+ SECRET_KEY=change-me
+ CORS_ORIGINS=http://localhost:5173
+ SESSION_TTL_MINUTES=720
++# Reverse proxies in front of the API that append to X-Forwarded-For (0 locally, 1 on Render).
++TRUSTED_PROXY_HOPS=0
++# Password hashes allowed to run at once (each uses about 64 MiB).
++PASSWORD_HASH_CONCURRENCY=2
+ # Optional first-run admin. Created only when the users table is empty.
+ # Password must be 12+ characters. Remove ADMIN_PASSWORD from the environment after your first login.
+ ADMIN_EMAIL=
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 9fa37aa..0105781 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -9,6 +9,18 @@ jobs:
+     defaults:
+       run:
+         working-directory: backend
++    services:
++      postgres:
++        image: postgres:16
++        env:
++          POSTGRES_PASSWORD: postgres
++          POSTGRES_DB: xvortex
++        ports: ["5432:5432"]
++        options: >-
++          --health-cmd "pg_isready -U postgres"
++          --health-interval 5s
++          --health-timeout 5s
++          --health-retries 10
+     steps:
+       - uses: actions/checkout@v4
+       - uses: actions/setup-python@v5
+@@ -16,4 +28,33 @@ jobs:
+           python-version: "3.12"
+           cache: pip
+       - run: pip install -r requirements-dev.txt
++      # Unit and API tests run on in-memory SQLite (see tests/conftest.py).
+       - run: pytest -q
++      # The real schema is Postgres: the migration must apply, match the models, and roll back.
++      - name: Migrations apply, match the models and roll back
++        env:
++          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/xvortex
++          SECRET_KEY: ci-only
++          ENVIRONMENT: development
++        run: |
++          alembic upgrade head
++          alembic check
++          alembic downgrade base
++          alembic upgrade head
++
++  frontend:
++    runs-on: ubuntu-latest
++    defaults:
++      run:
++        working-directory: frontend
++    steps:
++      - uses: actions/checkout@v4
++      - uses: actions/setup-node@v4
++        with:
++          node-version: "20"
++      # Reproducible once frontend/package-lock.json is committed; works without it until then.
++      - name: Install
++        run: |
++          if [ -f package-lock.json ]; then npm ci; else npm install --no-audit --no-fund; fi
++      # Type-checks (tsc --noEmit) and builds.
++      - run: npm run build
+diff --git a/README.md b/README.md
+index 9d8938f..43c80e7 100644
+--- a/README.md
++++ b/README.md
+@@ -10,7 +10,7 @@ phases 4 to 8; until then their pages say so and show no sample data.
+ 
+ ```
+ backend/            FastAPI app, SQLAlchemy models, Alembic migrations, tests
+-  app/api/          routers (auth, admin), dependencies (session, CSRF, admin checks)
++  app/api/          routers (auth, admin, dashboard, settings, notifications), dependencies (session, CSRF, admin checks)
+   app/core/         settings, Argon2 helpers, rate limiter, JSON logging
+   app/models/       one module per domain
+   app/services/     business logic (loan calculations, audit, admin bootstrap)
+@@ -24,13 +24,32 @@ render.yaml         Render Blueprint (API + static frontend)
+ ## Security model (phase 2)
+ 
+ - No public registration: an administrator creates accounts (Users page, or `ADMIN_EMAIL`/`ADMIN_PASSWORD` for the first one).
++- Passwords: anyone can change their own from Account (needs the current password, is rate limited, and replaces every
++  session including the current one, so a copied cookie stops working). An administrator can reset another user's
++  password from the Users page (optionally generated in the browser); that signs the user out everywhere and lifts a
++  sign-in lockout on the account. Both are audited. Admins cannot reset their own password that way.
++- Locked out as the only administrator? From `backend/` with `DATABASE_URL` set to your Neon connection string, run
++  `python -m app.cli reset-password you@example.com` (add `--activate` if the account was deactivated). It prompts for
++  the new password, signs the account out everywhere and writes an audit row. It runs on your machine, not over HTTP.
+ - Passwords are hashed with Argon2id; minimum 12 characters.
+ - Login creates a server-side session. The browser only holds a random token in an `HttpOnly`, `Secure`
+   (production), `SameSite=Lax` cookie; the database stores only its SHA-256 hash. Sessions expire after
+   `SESSION_TTL_MINUTES` (default 12 hours).
+ - State-changing requests need the `X-CSRF-Token` header that matches the session.
+-- Login is rate limited per IP (20 attempts / 5 min) and per account (5 failures / 15 min). The limiter is
+-  in memory, which is fine for one Render instance; use a shared store before scaling out.
++- Login is rate limited per IP (20 attempts / 5 min) and per account (5 failures / 15 min). Each attempt is
++  counted before the password is checked, so parallel requests cannot slip past the limit; a successful
++  sign-in clears the account's count. The limiter is in memory, which is fine for one Render instance; use a
++  shared store before scaling out. Trade-off: anyone who knows an email can lock that account for up to
++  15 minutes by failing five times.
++- Argon2 uses about 64 MiB per hash, and a Render instance has 512 MB. `PASSWORD_HASH_CONCURRENCY` (default 2)
++  caps how many hashes run at once; further logins wait their turn instead of exhausting memory.
++- Client IPs (audit log, per-IP limit) come from `X-Forwarded-For`, but Render appends to whatever the client
++  sent, so only entries written by trusted proxies are believed: `TRUSTED_PROXY_HOPS` entries counted from the
++  right (default 1). After the first deploy, sign in and check `select ip from audit_logs where action = 'login'
++  order by id desc limit 1;` against your own public IP. If it shows a Render or Cloudflare address, set
++  `TRUSTED_PROXY_HOPS=2`. If the header is missing or malformed, the socket address is used.
++- `ENVIRONMENT` must be `development` or `production`. It defaults to production, so a missing variable turns
++  protections on (Secure cookie, API docs off) instead of off.
+ - Unknown email and wrong password return the same message and take similar time.
+ - Logins, failures, logouts and user changes are written to `audit_logs`.
+ - Every private route is attached via `PRIVATE` in `app/api/deps.py`; admin routes add `require_admin`.
+@@ -53,7 +72,9 @@ npm install
+ npm run dev                  # http://localhost:5173, /api is proxied to localhost:8000
+ ```
+ 
+-Commit `frontend/package-lock.json` after the first `npm install`.
++Commit `frontend/package-lock.json` after the first `npm install`. CI and Render use `npm ci` once it exists
++(and `npm install` until then). CI runs the backend tests, applies the Alembic migration to a real Postgres
++(including `alembic check` against the models and a rollback), and type-checks and builds the frontend.
+ 
+ ## Deploy: GitHub, Neon, Render
+ 
+@@ -83,6 +104,8 @@ cookie work between the app and the API.
+   interest come from the stored repayment schedule and recorded payments (oldest installment first, interest before principal).
+ - Paper trading shows cash, invested amount at cost and realized profit/loss. Market value and unrealized
+   profit/loss are reported as unavailable until a price source exists (phase 5); they are never estimated.
++- Payments beyond what a loan owes are shown as "Paid beyond schedule" instead of being dropped. Remaining
++  interest follows the original schedule and is not recalculated after early repayments; the widget says so.
+ - Market watch and news show an explicit "not connected" note instead of placeholder quotes or headlines.
+ - Widget order and visibility are saved per user via `PUT /api/settings/dashboard-layout`.
+ - The bell in the top bar reads `GET /api/notifications` (each user sees only their own).
+@@ -91,7 +114,10 @@ cookie work between the app and the API.
+ 
+ - Money, prices and quantities are `NUMERIC`/`Decimal`, never floats.
+ - Paper-trading rows carry `is_simulated`, enforced `TRUE` by a database check constraint.
+-- Loan rules are documented in `backend/app/services/loans/amortization.py`; risk flags are rule-based, not predictions.
++- Loan rules are documented in `backend/app/services/loans/amortization.py`; risk flags are rule-based, not
++  predictions. A final period shorter than a full one pays prorated interest, and a schedule is capped at
++  1200 installments. Installments less than a week late are not flagged, and the concentration flag needs at
++  least three loans.
+ - Theme (dark or light) is stored in the browser for now; per-user settings sync arrives with the settings API.
+ 
+ ## Roadmap
+diff --git a/backend/app/api/admin.py b/backend/app/api/admin.py
+index 9645306..91248b6 100644
+--- a/backend/app/api/admin.py
++++ b/backend/app/api/admin.py
+@@ -6,11 +6,13 @@ from sqlalchemy.exc import IntegrityError
+ from sqlalchemy.orm import Session
+ 
+ from app.api.deps import PRIVATE, client_ip, require_admin
+-from app.api.schemas import UserActive, UserCreate, UserOut
++from app.api.auth import email_limiter
++from app.api.schemas import PasswordReset, UserActive, UserCreate, UserOut
+ from app.core.security import hash_password
+ from app.db import get_db
+ from app.models import User, UserSession, UserSettings
+ from app.services.audit import record_audit
++from app.services.passwords import set_password
+ 
+ # Registration is private: only an administrator can create accounts.
+ router = APIRouter(prefix="/api/admin", tags=["admin"], dependencies=[*PRIVATE, Depends(require_admin)])
+@@ -58,3 +60,24 @@ def set_user_active(
+     )
+     db.commit()
+     return user
++
++
++@router.post("/users/{user_id}/password", status_code=204)
++def reset_user_password(
++    user_id: uuid.UUID, body: PasswordReset, request: Request,
++    admin: User = Depends(require_admin), db: Session = Depends(get_db),
++):
++    """Set a new password for another user and sign them out everywhere. Your own password is
++    changed from your account page, which asks for the current one."""
++    user = db.get(User, user_id)
++    if user is None:
++        raise HTTPException(404, "User not found.")
++    if user.id == admin.id:
++        raise HTTPException(400, "Use Change password on your account page for your own password.")
++    revoked = set_password(db, user, body.new_password)
++    email_limiter.reset(user.email)  # also lifts a sign-in lockout on that account
++    record_audit(
++        db, "password_reset", user_id=admin.id, ip=client_ip(request), entity_type="user",
++        entity_id=str(user.id), details={"sessions_revoked": revoked},
++    )
++    db.commit()
+diff --git a/backend/app/api/auth.py b/backend/app/api/auth.py
+index f6bafde..6bff7dd 100644
+--- a/backend/app/api/auth.py
++++ b/backend/app/api/auth.py
+@@ -5,7 +5,7 @@ from sqlalchemy import delete, select
+ from sqlalchemy.orm import Session
+ 
+ from app.api.deps import COOKIE_NAME, PRIVATE, client_ip, current_user, get_session
+-from app.api.schemas import LoginIn, SessionOut, UserOut
++from app.api.schemas import LoginIn, PasswordChange, SessionOut, UserOut
+ from app.core.config import get_settings
+ from app.core.ratelimit import SlidingWindowLimiter
+ from app.core.security import (
+@@ -14,37 +14,56 @@ from app.core.security import (
+ from app.db import get_db
+ from app.models import User, UserSession
+ from app.services.audit import record_audit
++from app.services.passwords import set_password
+ 
+ router = APIRouter(prefix="/api/auth", tags=["auth"])
+ 
+-# Every attempt counts toward the IP limit; only failures count toward the per-account limit.
++# Each attempt is counted before the password is checked, so parallel requests cannot all slip
++# past the limit. A successful sign-in clears the per-account count, so only failures stick.
+ ip_limiter = SlidingWindowLimiter(max_events=20, window_seconds=300)
+ email_limiter = SlidingWindowLimiter(max_events=5, window_seconds=900)
++# Changing a password needs the current one, so a stolen session cannot be used to guess it freely.
++password_limiter = SlidingWindowLimiter(max_events=5, window_seconds=900)
+ 
+ 
+ def reset_limiters() -> None:
+     ip_limiter.clear()
+     email_limiter.clear()
++    password_limiter.clear()
++
++
++def _open_session(db: Session, user: User, request: Request, response: Response, ip: str) -> str:
++    """Add a new server-side session row, set its cookie on the response and return its CSRF token.
++    The caller commits."""
++    settings = get_settings()
++    token, csrf = new_session_token(), new_csrf_token()
++    db.add(UserSession(
++        id=hash_token(token), user_id=user.id, csrf_token=csrf,
++        expires_at=datetime.now(timezone.utc) + timedelta(minutes=settings.session_ttl_minutes),
++        ip=ip, user_agent=(request.headers.get("user-agent") or "")[:255] or None,
++    ))
++    response.set_cookie(
++        COOKIE_NAME, token, max_age=settings.session_ttl_minutes * 60,
++        httponly=True, secure=settings.is_production, samesite="lax", path="/",
++    )
++    return csrf
+ 
+ 
+ @router.post("/login", response_model=SessionOut)
+ def login(body: LoginIn, request: Request, response: Response, db: Session = Depends(get_db)):
+-    settings = get_settings()
+     ip = client_ip(request)
+     email = body.email.strip().lower()
+ 
+     for limiter, key in ((ip_limiter, ip), (email_limiter, email)):
+-        if limiter.is_blocked(key):
++        if not limiter.try_record(key):
+             raise HTTPException(
+                 429, "Too many sign-in attempts. Wait a few minutes and try again.",
+                 headers={"Retry-After": str(limiter.retry_after(key))},
+             )
+-    ip_limiter.record(ip)
+ 
+     user = db.scalar(select(User).where(User.email == email))
+     password_ok = verify_password(user.password_hash if user else dummy_hash(), body.password)
+     if user is None or not user.is_active or not password_ok:
+-        email_limiter.record(email)
+         record_audit(db, "login_failed", user_id=user.id if user else None, ip=ip, details={"email": email[:100]})
+         db.commit()
+         raise HTTPException(401, "Invalid email or password.")
+@@ -55,20 +74,10 @@ def login(body: LoginIn, request: Request, response: Response, db: Session = Dep
+ 
+     now = datetime.now(timezone.utc)
+     db.execute(delete(UserSession).where(UserSession.user_id == user.id, UserSession.expires_at < now))
+-    token, csrf = new_session_token(), new_csrf_token()
+-    db.add(UserSession(
+-        id=hash_token(token), user_id=user.id, csrf_token=csrf,
+-        expires_at=now + timedelta(minutes=settings.session_ttl_minutes),
+-        ip=ip, user_agent=(request.headers.get("user-agent") or "")[:255] or None,
+-    ))
++    csrf = _open_session(db, user, request, response, ip)
+     user.last_login_at = now
+     record_audit(db, "login", user_id=user.id, ip=ip)
+     db.commit()
+-
+-    response.set_cookie(
+-        COOKIE_NAME, token, max_age=settings.session_ttl_minutes * 60,
+-        httponly=True, secure=settings.is_production, samesite="lax", path="/",
+-    )
+     return SessionOut(user=UserOut.model_validate(user), csrf_token=csrf)
+ 
+ 
+@@ -77,6 +86,36 @@ def me(user: User = Depends(current_user), session: UserSession = Depends(get_se
+     return SessionOut(user=UserOut.model_validate(user), csrf_token=session.csrf_token)
+ 
+ 
++@router.post("/password", response_model=SessionOut, dependencies=PRIVATE)
++def change_password(
++    body: PasswordChange, request: Request, response: Response,
++    user: User = Depends(current_user), db: Session = Depends(get_db),
++):
++    """Change your own password. Every session is replaced, including this one, so a copied cookie
++    stops working; the response carries the new session's CSRF token."""
++    ip = client_ip(request)
++    key = str(user.id)
++    if not password_limiter.try_record(key):
++        raise HTTPException(
++            429, "Too many attempts. Wait a few minutes and try again.",
++            headers={"Retry-After": str(password_limiter.retry_after(key))},
++        )
++    # 400, not 401: the app treats a 401 as an expired session and signs the user out.
++    if not verify_password(user.password_hash, body.current_password):
++        record_audit(db, "password_change_failed", user_id=user.id, ip=ip)
++        db.commit()
++        raise HTTPException(400, "Your current password is not correct.")
++    if body.new_password == body.current_password:
++        raise HTTPException(400, "Choose a password that is different from the current one.")
++
++    password_limiter.reset(key)
++    revoked = set_password(db, user, body.new_password)
++    csrf = _open_session(db, user, request, response, ip)
++    record_audit(db, "password_changed", user_id=user.id, ip=ip, details={"sessions_revoked": revoked})
++    db.commit()
++    return SessionOut(user=UserOut.model_validate(user), csrf_token=csrf)
++
++
+ @router.post("/logout", status_code=204, dependencies=PRIVATE)
+ def logout(
+     request: Request, response: Response,
+diff --git a/backend/app/api/dashboard_schemas.py b/backend/app/api/dashboard_schemas.py
+index 7c97dd1..f6043be 100644
+--- a/backend/app/api/dashboard_schemas.py
++++ b/backend/app/api/dashboard_schemas.py
+@@ -13,6 +13,7 @@ class LoanTotalsOut(BaseModel):
+     outstanding_principal: Decimal
+     remaining_interest: Decimal
+     overdue_amount: Decimal
++    unapplied_payments: Decimal
+ 
+ 
+ class PaperSummaryOut(BaseModel):
+diff --git a/backend/app/api/deps.py b/backend/app/api/deps.py
+index bcf951f..5dcf71f 100644
+--- a/backend/app/api/deps.py
++++ b/backend/app/api/deps.py
+@@ -4,6 +4,8 @@ from datetime import datetime, timezone
+ from fastapi import Depends, HTTPException, Request
+ from sqlalchemy.orm import Session
+ 
++from app.core.clientip import resolve_client_ip
++from app.core.config import get_settings
+ from app.core.security import hash_token
+ from app.db import get_db
+ from app.models import User, UserSession
+@@ -17,13 +19,14 @@ def _aware(dt: datetime) -> datetime:
+ 
+ 
+ def client_ip(request: Request) -> str:
+-    """Best-effort client address. X-Forwarded-For is set by Render's proxy but its first entry can be
+-    client-supplied, so this is only used for audit logs and a coarse per-IP limit; the per-account
+-    limit is the real brute-force guard."""
+-    forwarded = request.headers.get("x-forwarded-for")
+-    if forwarded:
+-        return forwarded.split(",")[0].strip()[:45]
+-    return (request.client.host if request.client else "unknown")[:45]
++    """Best-effort client address for audit logs and the per-IP limit. Render's proxy appends to
++    X-Forwarded-For without clearing what the client sent, so only the entries a trusted proxy wrote
++    (counted from the right, TRUSTED_PROXY_HOPS) are believed. See resolve_client_ip."""
++    return resolve_client_ip(
++        request.client.host if request.client else None,
++        request.headers.get("x-forwarded-for"),
++        get_settings().trusted_proxy_hops,
++    )
+ 
+ 
+ def get_session(request: Request, db: Session = Depends(get_db)) -> UserSession:
+@@ -51,7 +54,8 @@ def require_csrf(request: Request, session: UserSession = Depends(get_session))
+     if request.method in SAFE_METHODS:
+         return
+     sent = request.headers.get("x-csrf-token", "")
+-    if not hmac.compare_digest(sent, session.csrf_token):
++    # Compare bytes: compare_digest raises TypeError on non-ASCII str, which would be a 500.
++    if not hmac.compare_digest(sent.encode(), session.csrf_token.encode()):
+         raise HTTPException(403, "Missing or invalid CSRF token. Reload the page and try again.")
+ 
+ 
+diff --git a/backend/app/api/schemas.py b/backend/app/api/schemas.py
+index d74fa37..c082006 100644
+--- a/backend/app/api/schemas.py
++++ b/backend/app/api/schemas.py
+@@ -3,6 +3,8 @@ import uuid
+ from pydantic import BaseModel, ConfigDict, Field
+ 
+ EMAIL_PATTERN = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
++MIN_PASSWORD_LENGTH = 12
++MAX_PASSWORD_LENGTH = 128
+ 
+ 
+ class UserOut(BaseModel):
+@@ -27,9 +29,18 @@ class SessionOut(BaseModel):
+ class UserCreate(BaseModel):
+     email: str = Field(min_length=3, max_length=320, pattern=EMAIL_PATTERN)
+     display_name: str = Field(min_length=1, max_length=120)
+-    password: str = Field(min_length=12, max_length=128)
++    password: str = Field(min_length=MIN_PASSWORD_LENGTH, max_length=MAX_PASSWORD_LENGTH)
+     is_admin: bool = False
+ 
+ 
+ class UserActive(BaseModel):
+     is_active: bool
++
++
++class PasswordChange(BaseModel):
++    current_password: str = Field(min_length=1, max_length=MAX_PASSWORD_LENGTH)
++    new_password: str = Field(min_length=MIN_PASSWORD_LENGTH, max_length=MAX_PASSWORD_LENGTH)
++
++
++class PasswordReset(BaseModel):
++    new_password: str = Field(min_length=MIN_PASSWORD_LENGTH, max_length=MAX_PASSWORD_LENGTH)
+diff --git a/backend/app/cli.py b/backend/app/cli.py
+new file mode 100644
+index 0000000..8028d25
+--- /dev/null
++++ b/backend/app/cli.py
+@@ -0,0 +1,63 @@
++"""Operator tools that run on your own machine against the real database, never over HTTP.
++
++Run from backend/ with DATABASE_URL set (for example in backend/.env, using the Neon connection string):
++
++    python -m app.cli reset-password you@example.com
++    python -m app.cli reset-password you@example.com --activate
++
++This is the way back in if the only administrator forgets their password. It signs the account out
++everywhere and writes an audit row.
++"""
++import argparse
++import getpass
++import sys
++
++from sqlalchemy import select
++
++from app.api.schemas import MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH
++from app.db import SessionLocal
++from app.models import User
++from app.services.audit import record_audit
++from app.services.passwords import set_password
++
++
++def reset_password(email: str, activate: bool) -> int:
++    with SessionLocal() as db:
++        user = db.scalar(select(User).where(User.email == email.strip().lower()))
++        if user is None:
++            print("No user with that email.", file=sys.stderr)
++            return 1
++        password = getpass.getpass("New password: ")
++        if password != getpass.getpass("Repeat it: "):
++            print("The two entries differ. Nothing was changed.", file=sys.stderr)
++            return 1
++        if not MIN_PASSWORD_LENGTH <= len(password) <= MAX_PASSWORD_LENGTH:
++            print(
++                f"The password must be {MIN_PASSWORD_LENGTH} to {MAX_PASSWORD_LENGTH} characters. Nothing was changed.",
++                file=sys.stderr,
++            )
++            return 1
++        revoked = set_password(db, user, password)
++        if activate:
++            user.is_active = True
++        record_audit(
++            db, "password_reset_cli", user_id=user.id, entity_type="user", entity_id=str(user.id),
++            details={"sessions_revoked": revoked, "activated": activate},
++        )
++        db.commit()
++        print(f"Password updated for {user.email}; {revoked} session(s) signed out.")
++        return 0
++
++
++def main(argv: list[str] | None = None) -> int:
++    parser = argparse.ArgumentParser(prog="python -m app.cli", description=__doc__.splitlines()[0])
++    sub = parser.add_subparsers(dest="command", required=True)
++    reset = sub.add_parser("reset-password", help="set a new password for an account")
++    reset.add_argument("email")
++    reset.add_argument("--activate", action="store_true", help="also reactivate a deactivated account")
++    args = parser.parse_args(argv)
++    return reset_password(args.email, args.activate)
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/backend/app/core/clientip.py b/backend/app/core/clientip.py
+new file mode 100644
+index 0000000..c72788e
+--- /dev/null
++++ b/backend/app/core/clientip.py
+@@ -0,0 +1,21 @@
++import ipaddress
++
++
++def resolve_client_ip(peer: str | None, forwarded_for: str | None, trusted_hops: int) -> str:
++    """Best-effort client address behind `trusted_hops` reverse proxies that each append to X-Forwarded-For.
++
++    A proxy appends the address it saw to the header, so entries on the right were written by
++    infrastructure you control and entries on the left can be forged by the client. The address
++    `trusted_hops` places from the right is the first one a trusted proxy recorded. If the header is
++    missing, too short or malformed, fall back to the socket peer rather than trusting it.
++    """
++    peer = (peer or "unknown")[:45]
++    if trusted_hops <= 0 or not forwarded_for:
++        return peer
++    parts = [p.strip() for p in forwarded_for.split(",") if p.strip()]
++    if len(parts) < trusted_hops:
++        return peer
++    try:
++        return str(ipaddress.ip_address(parts[-trusted_hops]))
++    except ValueError:
++        return peer
+diff --git a/backend/app/core/concurrency.py b/backend/app/core/concurrency.py
+new file mode 100644
+index 0000000..579def8
+--- /dev/null
++++ b/backend/app/core/concurrency.py
+@@ -0,0 +1,26 @@
++import threading
++from collections.abc import Callable
++
++
++class Slots:
++    """Context manager that lets at most `size()` threads inside at once; the others wait.
++
++    The size is read on first use, so settings are not touched at import time.
++    """
++
++    def __init__(self, size: Callable[[], int]):
++        self._size = size
++        self._sem: threading.BoundedSemaphore | None = None
++        self._guard = threading.Lock()
++
++    def _semaphore(self) -> threading.BoundedSemaphore:
++        with self._guard:
++            if self._sem is None:
++                self._sem = threading.BoundedSemaphore(max(1, self._size()))
++            return self._sem
++
++    def __enter__(self) -> None:
++        self._semaphore().acquire()
++
++    def __exit__(self, *exc: object) -> None:
++        self._semaphore().release()
+diff --git a/backend/app/core/config.py b/backend/app/core/config.py
+index ee3ee64..d97985f 100644
+--- a/backend/app/core/config.py
++++ b/backend/app/core/config.py
+@@ -1,21 +1,39 @@
+ from functools import lru_cache
+ 
+-from pydantic import field_validator
++from pydantic import Field, field_validator
+ from pydantic_settings import BaseSettings, SettingsConfigDict
+ 
+ 
+ class Settings(BaseSettings):
+     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+ 
+-    environment: str = "development"
++    # Fails closed: an unset ENVIRONMENT means production (Secure cookies, API docs off).
++    # Local development sets ENVIRONMENT=development in backend/.env.
++    environment: str = "production"
+     database_url: str
++    # Not used by any feature yet; reserved for signing tokens in later phases.
+     secret_key: str
+     cors_origins: str = "http://localhost:5173"
+     session_ttl_minutes: int = 720
++    # Number of reverse proxies in front of the API that append to X-Forwarded-For (Render: see README).
++    # 0 ignores the header and uses the socket address.
++    trusted_proxy_hops: int = Field(default=1, ge=0, le=5)
++    # Password hashing uses ~64 MiB per call; this caps how many run at once so a burst of logins
++    # cannot exhaust a small instance's memory.
++    password_hash_concurrency: int = Field(default=2, ge=1, le=16)
+     # Optional first-run bootstrap: creates this admin only if the users table is empty.
+     admin_email: str | None = None
+     admin_password: str | None = None
+ 
++    @field_validator("environment")
++    @classmethod
++    def known_environment(cls, v: str) -> str:
++        v = v.strip().lower()
++        if v not in ("development", "production"):
++            # A typo such as "prod" must not silently switch off production protections.
++            raise ValueError("ENVIRONMENT must be 'development' or 'production'")
++        return v
++
+     @field_validator("database_url")
+     @classmethod
+     def use_psycopg3_driver(cls, v: str) -> str:
+diff --git a/backend/app/core/ratelimit.py b/backend/app/core/ratelimit.py
+index f0ca529..dbdea30 100644
+--- a/backend/app/core/ratelimit.py
++++ b/backend/app/core/ratelimit.py
+@@ -1,3 +1,4 @@
++import threading
+ import time
+ from collections import deque
+ from collections.abc import Callable
+@@ -5,14 +6,28 @@ from math import ceil
+ 
+ 
+ class SlidingWindowLimiter:
+-    """In-memory sliding-window counter. Per process: adequate for a single Render instance;
+-    switch to a shared store (e.g. Redis) before running several instances."""
++    """In-memory sliding-window counter, safe to call from several threads.
+ 
+-    def __init__(self, max_events: int, window_seconds: float, clock: Callable[[], float] = time.monotonic):
++    Per process: adequate for a single Render instance; switch to a shared store (e.g. Redis)
++    before running several instances.
++
++    Use `try_record` for gates: it checks and records in one step, so parallel requests cannot all
++    pass the check before any of them is counted. Memory is bounded: past `max_keys` tracked keys,
++    expired keys are dropped first, then the oldest-seen keys.
++    """
++
++    def __init__(
++        self, max_events: int, window_seconds: float,
++        clock: Callable[[], float] = time.monotonic, max_keys: int = 10_000,
++    ):
+         self.max_events = max_events
+         self.window = window_seconds
++        self.max_keys = max_keys
+         self._clock = clock
+         self._events: dict[str, deque[float]] = {}
++        self._lock = threading.Lock()
++
++    # The helpers below assume the caller holds self._lock.
+ 
+     def _prune(self, key: str) -> deque[float] | None:
+         q = self._events.get(key)
+@@ -26,24 +41,50 @@ class SlidingWindowLimiter:
+             return None
+         return q
+ 
++    def _make_room(self) -> None:
++        for k in list(self._events):
++            self._prune(k)
++        target = self.max_keys - max(1, self.max_keys // 10)  # leave headroom so this runs rarely
++        while len(self._events) > target:
++            del self._events[next(iter(self._events))]
++
++    def _append(self, key: str) -> None:
++        if key not in self._events and len(self._events) >= self.max_keys:
++            self._make_room()
++        self._events.setdefault(key, deque()).append(self._clock())
++
++    # Public API.
++
+     def is_blocked(self, key: str) -> bool:
+-        q = self._prune(key)
+-        return q is not None and len(q) >= self.max_events
++        with self._lock:
++            q = self._prune(key)
++            return q is not None and len(q) >= self.max_events
+ 
+     def retry_after(self, key: str) -> int:
+-        q = self._prune(key)
+-        if q is None or len(q) < self.max_events:
+-            return 0
+-        return max(1, ceil(q[0] + self.window - self._clock()))
++        with self._lock:
++            q = self._prune(key)
++            if q is None or len(q) < self.max_events:
++                return 0
++            return max(1, ceil(q[0] + self.window - self._clock()))
+ 
+     def record(self, key: str) -> None:
+-        if len(self._events) > 10_000:
+-            for k in list(self._events):
+-                self._prune(k)
+-        self._events.setdefault(key, deque()).append(self._clock())
++        """Count an event unconditionally."""
++        with self._lock:
++            self._append(key)
++
++    def try_record(self, key: str) -> bool:
++        """Count an event unless the key is already at its limit. Returns whether it was counted."""
++        with self._lock:
++            q = self._prune(key)
++            if q is not None and len(q) >= self.max_events:
++                return False
++            self._append(key)
++            return True
+ 
+     def reset(self, key: str) -> None:
+-        self._events.pop(key, None)
++        with self._lock:
++            self._events.pop(key, None)
+ 
+     def clear(self) -> None:
+-        self._events.clear()
++        with self._lock:
++            self._events.clear()
+diff --git a/backend/app/core/security.py b/backend/app/core/security.py
+index 29521ee..caff6b7 100644
+--- a/backend/app/core/security.py
++++ b/backend/app/core/security.py
+@@ -4,19 +4,26 @@ import secrets
+ from argon2 import PasswordHasher
+ from argon2.exceptions import InvalidHashError, VerificationError
+ 
++from app.core.concurrency import Slots
++from app.core.config import get_settings
++
+ _hasher = PasswordHasher()  # Argon2id with the library's current recommended parameters
+ _dummy_hash: str | None = None
++# Each hash or verify allocates ~64 MiB, so only a few may run at once (PASSWORD_HASH_CONCURRENCY).
++_hash_slots = Slots(lambda: get_settings().password_hash_concurrency)
+ 
+ 
+ def hash_password(password: str) -> str:
+-    return _hasher.hash(password)
++    with _hash_slots:
++        return _hasher.hash(password)
+ 
+ 
+ def verify_password(password_hash: str, password: str) -> bool:
+-    try:
+-        return _hasher.verify(password_hash, password)
+-    except (VerificationError, InvalidHashError):
+-        return False
++    with _hash_slots:
++        try:
++            return _hasher.verify(password_hash, password)
++        except (VerificationError, InvalidHashError):
++            return False
+ 
+ 
+ def needs_rehash(password_hash: str) -> bool:
+@@ -27,7 +34,7 @@ def dummy_hash() -> str:
+     """Verified against when the email is unknown, so response time doesn't reveal which emails exist."""
+     global _dummy_hash
+     if _dummy_hash is None:
+-        _dummy_hash = _hasher.hash(secrets.token_urlsafe(16))
++        _dummy_hash = hash_password(secrets.token_urlsafe(16))
+     return _dummy_hash
+ 
+ 
+diff --git a/backend/app/main.py b/backend/app/main.py
+index 68ca8b9..46cb160 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -64,8 +64,10 @@ app.include_router(notifications.router)
+ 
+ 
+ @app.get("/healthz", include_in_schema=False)
+-def healthz() -> dict[str, str]:
+-    """Liveness: the process is up. Used by Render's health check."""
++async def healthz() -> dict[str, str]:
++    """Liveness: the process is up. Used by Render's health check.
++    Async on purpose: it runs on the event loop, so it still answers when every worker thread
++    is busy (for example queued behind password hashing)."""
+     return {"status": "ok"}
+ 
+ 
+diff --git a/backend/app/services/dashboard.py b/backend/app/services/dashboard.py
+index 731ffb1..ea57884 100644
+--- a/backend/app/services/dashboard.py
++++ b/backend/app/services/dashboard.py
+@@ -139,7 +139,7 @@ def build_summary(db: Session, user: User, today: date | None = None) -> dict[st
+         "loans": [
+             {k: getattr(t, k) for k in (
+                 "currency", "active_loans", "overdue_loans", "total_lent",
+-                "outstanding_principal", "remaining_interest", "overdue_amount")}
++                "outstanding_principal", "remaining_interest", "overdue_amount", "unapplied_payments")}
+             for t in totals
+         ],
+         "paper": _paper(db, user.id, currency),
+diff --git a/backend/app/services/loans/amortization.py b/backend/app/services/loans/amortization.py
+index 148531d..9d91014 100644
+--- a/backend/app/services/loans/amortization.py
++++ b/backend/app/services/loans/amortization.py
+@@ -9,6 +9,10 @@ Documented conventions (configurable per loan via `method` and `frequency`):
+     equal_principal  equal principal installments (total shrinks over time)
+     interest_only    interest each period, full principal at maturity
+ - Due dates are start_date + k periods; the last installment is always on maturity_date.
++  When maturity falls before the next regular date, the last installment covers a short period and
++  its interest is prorated by days (actual days / days in the full period) instead of charging a
++  whole period.
++- A schedule may have at most MAX_INSTALLMENTS installments.
+ - Payments are allocated to the oldest unpaid installment first, interest before principal.
+ - Prepayments do not recompute the schedule in this version; they reduce the remaining
+   principal due on the oldest installments.
+@@ -19,6 +23,8 @@ from datetime import date, timedelta
+ from decimal import ROUND_HALF_UP, Decimal
+ 
+ CENT = Decimal("0.01")
++ONE = Decimal(1)
++MAX_INSTALLMENTS = 1200  # 100 years of monthly installments; stops absurd inputs creating huge schedules
+ PERIODS_PER_YEAR = {
+     "weekly": 52, "biweekly": 26, "monthly": 12, "quarterly": 4, "semiannual": 2, "annual": 1,
+ }
+@@ -83,12 +89,25 @@ def due_dates(start: date, maturity: date, frequency: str) -> list[date]:
+         raise ValueError("maturity must be after start")
+     dates, k = [], 1
+     while (d := due_date(start, frequency, k)) < maturity:
++        if len(dates) + 2 > MAX_INSTALLMENTS:  # this date plus the final one on maturity
++            raise ValueError(f"schedule would have more than {MAX_INSTALLMENTS} installments")
+         dates.append(d)
+         k += 1
+     dates.append(maturity)
+     return dates
+ 
+ 
++def final_period_fraction(start: date, frequency: str, dates: list[date]) -> Decimal:
++    """Share of a full period covered by the last installment: 1 when maturity is a regular due date,
++    less when it falls earlier (a short final period)."""
++    n = len(dates)
++    previous = dates[-2] if n > 1 else start
++    regular_end = due_date(start, frequency, n)
++    if dates[-1] >= regular_end:
++        return ONE
++    return Decimal((dates[-1] - previous).days) / Decimal((regular_end - previous).days)
++
++
+ def build_schedule(
+     principal: Decimal,
+     annual_rate_percent: Decimal,
+@@ -107,6 +126,7 @@ def build_schedule(
+     dates = due_dates(start, maturity, frequency)
+     n = len(dates)
+     r = annual_rate_percent / Decimal(100) / PERIODS_PER_YEAR[frequency]
++    r_last = r * final_period_fraction(start, frequency, dates)
+ 
+     if method == "annuity":
+         level = principal / n if r == 0 else principal * r / (1 - (1 + r) ** -n)
+@@ -116,8 +136,8 @@ def build_schedule(
+ 
+     balance, out = principal, []
+     for i, d in enumerate(dates, start=1):
+-        interest = money(balance * r)
+         last = i == n
++        interest = money(balance * (r_last if last else r))
+         if method == "interest_only":
+             princ = balance if last else Decimal("0.00")
+         elif last:
+diff --git a/backend/app/services/loans/portfolio.py b/backend/app/services/loans/portfolio.py
+index 97eabd9..e96fce1 100644
+--- a/backend/app/services/loans/portfolio.py
++++ b/backend/app/services/loans/portfolio.py
+@@ -27,11 +27,13 @@ class CurrencyTotals:
+     outstanding_principal: Decimal = ZERO
+     remaining_interest: Decimal = ZERO
+     overdue_amount: Decimal = ZERO
++    unapplied_payments: Decimal = ZERO  # paid beyond everything the schedule asks for
+     loan_ids: list = field(default_factory=list)
+ 
+ 
+ def summarize_loans(loans: list[LoanSnapshot], today: date) -> list[CurrencyTotals]:
+-    """A loan with no stored schedule falls back to principal minus payments (never below zero)."""
++    """A loan with no stored schedule falls back to principal minus payments (never below zero).
++    Payments beyond what a loan owes are reported as `unapplied_payments`, not silently dropped."""
+     by_currency: dict[str, CurrencyTotals] = {}
+     for loan in loans:
+         t = by_currency.setdefault(loan.currency, CurrencyTotals(loan.currency))
+@@ -39,9 +41,12 @@ def summarize_loans(loans: list[LoanSnapshot], today: date) -> list[CurrencyTota
+         t.total_lent += loan.principal
+         t.loan_ids.append(loan.loan_id)
+         if not loan.schedule:
+-            t.outstanding_principal += max(loan.principal - sum(loan.payments, ZERO), ZERO)
++            paid = sum(loan.payments, ZERO)
++            t.outstanding_principal += max(loan.principal - paid, ZERO)
++            t.unapplied_payments += max(paid - loan.principal, ZERO)
+             continue
+-        allocations, _excess = allocate_payments(loan.schedule, loan.payments)
++        allocations, excess = allocate_payments(loan.schedule, loan.payments)
++        t.unapplied_payments += excess
+         t.outstanding_principal += outstanding_principal(allocations)
+         t.remaining_interest += remaining_interest(allocations)
+         overdue = overdue_installments(allocations, today)
+@@ -49,6 +54,6 @@ def summarize_loans(loans: list[LoanSnapshot], today: date) -> list[CurrencyTota
+             t.overdue_loans += 1
+             t.overdue_amount += sum((a.principal_outstanding + a.interest_outstanding for a, _ in overdue), ZERO)
+     for t in by_currency.values():
+-        for name in ("total_lent", "outstanding_principal", "remaining_interest", "overdue_amount"):
++        for name in ("total_lent", "outstanding_principal", "remaining_interest", "overdue_amount", "unapplied_payments"):
+             setattr(t, name, money(getattr(t, name)))
+     return sorted(by_currency.values(), key=lambda t: t.currency)
+diff --git a/backend/app/services/loans/risk.py b/backend/app/services/loans/risk.py
+index 04560b1..d8af219 100644
+--- a/backend/app/services/loans/risk.py
++++ b/backend/app/services/loans/risk.py
+@@ -2,6 +2,10 @@
+ 
+ These are descriptive flags derived from payment history, not a prediction of default.
+ Every flag lists the rule that triggered it so the user can see exactly why.
++
++An installment that is only a few days late is not flagged (the overdue_days_medium grace period);
++the dashboard still counts it as overdue. Portfolio figures passed in must be in the same currency
++as the loan being assessed: amounts in different currencies are never added together.
+ """
+ from dataclasses import dataclass, field
+ from datetime import date
+@@ -17,11 +21,12 @@ DISCLAIMER = (
+ 
+ @dataclass(frozen=True)
+ class RiskRules:
+-    overdue_days_medium: int = 7
++    overdue_days_medium: int = 7  # grace period: a shorter delay is not flagged
+     overdue_days_high: int = 30
+-    missed_medium: int = 1
++    missed_medium: int = 2
+     missed_high: int = 3
+     exposure_share_high: Decimal = Decimal("0.40")  # share of total portfolio outstanding
++    exposure_min_loans: int = 3  # with fewer loans, any one of them is a large share by construction
+ 
+ 
+ @dataclass
+@@ -44,6 +49,7 @@ def assess_loan(
+     today: date,
+     outstanding: Decimal,
+     portfolio_outstanding: Decimal,
++    portfolio_loans: int,
+     rules: RiskRules = RiskRules(),
+ ) -> RiskAssessment:
+     overdue = overdue_installments(allocations, today)
+@@ -64,9 +70,13 @@ def assess_loan(
+         raise_to("medium", f"An installment is {max_days} days overdue (medium threshold {rules.overdue_days_medium}).")
+     if missed >= rules.missed_high:
+         raise_to("high", f"{missed} installments are unpaid past due (high threshold {rules.missed_high}).")
+-    elif missed >= rules.missed_medium and max_days >= 1:
+-        raise_to("medium", f"{missed} installment(s) are unpaid past due.")
+-    if portfolio_outstanding > 0 and outstanding / portfolio_outstanding >= rules.exposure_share_high:
++    elif missed >= rules.missed_medium:
++        raise_to("medium", f"{missed} installments are unpaid past due (medium threshold {rules.missed_medium}).")
++    if (
++        portfolio_loans >= rules.exposure_min_loans
++        and portfolio_outstanding > 0
++        and outstanding / portfolio_outstanding >= rules.exposure_share_high
++    ):
+         share = (outstanding / portfolio_outstanding * 100).quantize(Decimal("0.1"))
+         raise_to("medium", f"This loan is {share}% of total outstanding principal.")
+     return RiskAssessment(level, triggers)
+diff --git a/backend/app/services/passwords.py b/backend/app/services/passwords.py
+new file mode 100644
+index 0000000..3eb4350
+--- /dev/null
++++ b/backend/app/services/passwords.py
+@@ -0,0 +1,13 @@
++from sqlalchemy import delete
++from sqlalchemy.orm import Session
++
++from app.core.security import hash_password
++from app.models import User, UserSession
++
++
++def set_password(db: Session, user: User, new_password: str) -> int:
++    """Replace the user's password hash and delete all of their sessions, so every device is signed
++    out. Returns how many sessions were revoked. The caller audits and commits (and, when the user is
++    changing their own password, opens a fresh session afterwards)."""
++    user.password_hash = hash_password(new_password)
++    return db.execute(delete(UserSession).where(UserSession.user_id == user.id)).rowcount or 0
+diff --git a/backend/tests/conftest.py b/backend/tests/conftest.py
+index b177acc..f1a10bc 100644
+--- a/backend/tests/conftest.py
++++ b/backend/tests/conftest.py
+@@ -2,6 +2,7 @@ import os
+ 
+ os.environ.setdefault("DATABASE_URL", "sqlite+pysqlite:///:memory:")
+ os.environ.setdefault("SECRET_KEY", "test-secret")
++os.environ.setdefault("ENVIRONMENT", "development")  # the setting defaults to production (Secure cookies)
+ 
+ import pytest  # noqa: E402
+ 
+diff --git a/backend/tests/test_amortization.py b/backend/tests/test_amortization.py
+index 1930309..54cbe6a 100644
+--- a/backend/tests/test_amortization.py
++++ b/backend/tests/test_amortization.py
+@@ -1,8 +1,11 @@
+ from datetime import date
+ from decimal import Decimal as D
+ 
++import pytest
++
+ from app.services.loans.amortization import (
+-    allocate_payments, add_months, build_schedule, due_dates, outstanding_principal, remaining_interest,
++    MAX_INSTALLMENTS, allocate_payments, add_months, build_schedule, due_dates, final_period_fraction,
++    outstanding_principal, remaining_interest,
+ )
+ 
+ 
+@@ -64,3 +67,33 @@ def test_allocation_partial_and_overpayment():
+     assert remaining_interest(allocs) == total_interest - D("12.00")
+     allocs, excess = allocate_payments(s, [D("999999")])
+     assert outstanding_principal(allocs) == 0 and excess > 0
++
++
++def test_short_final_period_charges_prorated_interest_not_a_full_period():
++    # Regular dates run to May 31; maturity is Jun 1, one day into a 30-day period (May 31 to Jun 30).
++    s = build_schedule(D("10000"), D("12"), date(2026, 1, 31), date(2026, 6, 1), "monthly", "annuity")
++    assert [i.due_date for i in s][-2:] == [date(2026, 5, 31), date(2026, 6, 1)]
++    assert s[-2].interest == D("40.60") and s[-1].interest == D("0.68")  # 2040.00 * 1% / 30 days
++    assert sum(i.principal for i in s) == D("10000.00")
++
++
++def test_schedule_ending_on_a_regular_date_is_unchanged():
++    dates = due_dates(date(2026, 1, 1), date(2026, 7, 1), "monthly")
++    assert final_period_fraction(date(2026, 1, 1), "monthly", dates) == 1
++    s = build_schedule(D("1200"), D("12"), date(2026, 1, 1), date(2026, 7, 1), "monthly", "equal_principal")
++    assert s[-1].interest == D("2.00")  # a full month on the last 200.00
++
++
++def test_loan_shorter_than_one_period_is_prorated_too():
++    s = build_schedule(D("1000"), D("12"), date(2026, 1, 1), date(2026, 1, 11), "monthly", "interest_only")
++    assert len(s) == 1 and s[0].principal == D("1000.00")
++    assert s[0].interest == D("3.23")  # 1000 * 1% * 10/31
++
++
++def test_installment_count_is_capped():
++    assert len(due_dates(date(2026, 1, 1), date(2126, 1, 1), "monthly")) == MAX_INSTALLMENTS
++    for end in (date(2126, 2, 1), date(9999, 1, 1)):
++        with pytest.raises(ValueError, match="more than"):
++            due_dates(date(2026, 1, 1), end, "monthly")
++    with pytest.raises(ValueError, match="more than"):
++        build_schedule(D("1000"), D("5"), date(2026, 1, 1), date(2100, 1, 1), "weekly", "annuity")
+diff --git a/backend/tests/test_auth_api.py b/backend/tests/test_auth_api.py
+index 723c695..01b0d08 100644
+--- a/backend/tests/test_auth_api.py
++++ b/backend/tests/test_auth_api.py
+@@ -5,7 +5,7 @@ import pytest
+ pytest.importorskip("fastapi")
+ pytest.importorskip("argon2")
+ 
+-from tests.helpers import login, login_csrf  # noqa: E402
++from tests.helpers import PASSWORD, login, login_csrf  # noqa: E402
+ 
+ 
+ def test_login_sets_httponly_cookie_and_returns_csrf(client):
+@@ -56,3 +56,74 @@ def test_account_locks_after_repeated_failures(client):
+         assert login(client, password="wrong password!!").status_code == 401
+     r = login(client)  # even the right password is refused while locked
+     assert r.status_code == 429 and "retry-after" in r.headers
++
++
++def _second_device():
++    """A separate client (own cookie jar) on the same app and database."""
++    from fastapi.testclient import TestClient
++
++    from app.main import app
++
++    return TestClient(app)
++
++
++def test_password_change_replaces_every_session_and_the_new_password_works(client):
++    other = _second_device()
++    login(other)  # the same account signed in elsewhere
++    headers = login_csrf(client)
++    new = "a brand new long password"
++    body = {"current_password": PASSWORD, "new_password": new}
++
++    assert client.post("/api/auth/password", json=body).status_code == 403  # needs the CSRF header
++    wrong = {"current_password": "not the password", "new_password": new}
++    assert client.post("/api/auth/password", json=wrong, headers=headers).status_code == 400
++
++    ok = client.post("/api/auth/password", json=body, headers=headers)
++    assert ok.status_code == 200 and ok.json()["csrf_token"] != headers["X-CSRF-Token"]
++    assert client.get("/api/auth/me").status_code == 200  # this device continues on a fresh session
++    assert other.get("/api/auth/me").status_code == 401  # the other device is signed out
++    client.cookies.clear()
++    assert login(client, password=PASSWORD).status_code == 401
++    assert login(client, password=new).status_code == 200
++
++
++def test_password_change_validates_the_new_password(client):
++    headers = login_csrf(client)
++    short = {"current_password": PASSWORD, "new_password": "short"}
++    assert client.post("/api/auth/password", json=short, headers=headers).status_code == 422
++    same = {"current_password": PASSWORD, "new_password": PASSWORD}
++    assert client.post("/api/auth/password", json=same, headers=headers).status_code == 400
++    assert login(client).status_code == 200  # nothing changed
++
++
++def test_password_change_is_rate_limited(client):
++    headers = login_csrf(client)
++    guess = {"current_password": "guessing the password", "new_password": "some other long password"}
++    for _ in range(5):
++        assert client.post("/api/auth/password", json=guess, headers=headers).status_code == 400
++    blocked = client.post("/api/auth/password", json=guess, headers=headers)
++    assert blocked.status_code == 429 and "retry-after" in blocked.headers
++
++
++def test_admin_can_reset_a_password_and_that_user_is_signed_out(client):
++    member = _second_device()
++    login(member, "user@example.com")
++    headers = login_csrf(client)  # the administrator
++    users = client.get("/api/admin/users").json()
++    member_id = next(u["id"] for u in users if u["email"] == "user@example.com")
++    admin_id = next(u["id"] for u in users if u["email"] == "admin@example.com")
++    new = "reset by the administrator"
++    url = f"/api/admin/users/{member_id}/password"
++
++    assert client.post(url, json={"new_password": new}).status_code == 403  # needs the CSRF header
++    assert client.post(url, json={"new_password": "short"}, headers=headers).status_code == 422
++    assert client.post(f"/api/admin/users/{admin_id}/password", json={"new_password": new}, headers=headers).status_code == 400
++    assert client.post(url, json={"new_password": new}, headers=headers).status_code == 204
++
++    assert member.get("/api/auth/me").status_code == 401
++    member.cookies.clear()
++    assert login(member, "user@example.com").status_code == 401  # the old password is gone
++    signed_in = login(member, "user@example.com", new)
++    assert signed_in.status_code == 200
++    member_headers = {"X-CSRF-Token": signed_in.json()["csrf_token"]}
++    assert member.post(f"/api/admin/users/{admin_id}/password", json={"new_password": new}, headers=member_headers).status_code == 403
+diff --git a/backend/tests/test_clientip.py b/backend/tests/test_clientip.py
+new file mode 100644
+index 0000000..0dabe47
+--- /dev/null
++++ b/backend/tests/test_clientip.py
+@@ -0,0 +1,27 @@
++from app.core.clientip import resolve_client_ip as resolve
++
++
++def test_one_trusted_hop_uses_the_entry_the_proxy_appended_not_the_forged_one():
++    # The client sent "6.6.6.6"; the proxy appended the address it actually saw.
++    assert resolve("10.0.0.1", "6.6.6.6, 203.0.113.9", 1) == "203.0.113.9"
++
++
++def test_two_hops_skip_the_second_proxy():
++    assert resolve("10.0.0.1", "6.6.6.6, 203.0.113.9, 172.70.1.2", 2) == "203.0.113.9"
++
++
++def test_zero_hops_ignores_the_header():
++    assert resolve("10.0.0.1", "203.0.113.9", 0) == "10.0.0.1"
++
++
++def test_missing_short_or_malformed_header_falls_back_to_the_socket_peer():
++    assert resolve("10.0.0.1", None, 1) == "10.0.0.1"
++    assert resolve("10.0.0.1", "", 1) == "10.0.0.1"
++    assert resolve("10.0.0.1", "203.0.113.9", 2) == "10.0.0.1"
++    assert resolve("10.0.0.1", "203.0.113.9, not-an-ip", 1) == "10.0.0.1"
++    assert resolve(None, None, 1) == "unknown"
++
++
++def test_ipv6_is_normalised_and_fits_the_column():
++    ip = resolve("10.0.0.1", "2001:0db8:0000:0000:0000:0000:0000:0001", 1)
++    assert ip == "2001:db8::1" and len(ip) <= 45
+diff --git a/backend/tests/test_concurrency.py b/backend/tests/test_concurrency.py
+new file mode 100644
+index 0000000..92f4f27
+--- /dev/null
++++ b/backend/tests/test_concurrency.py
+@@ -0,0 +1,47 @@
++import threading
++import time
++
++from app.core.concurrency import Slots
++
++
++def test_slots_cap_how_many_threads_run_at_once():
++    slots = Slots(lambda: 2)
++    running, peak, lock = 0, 0, threading.Lock()
++
++    def work():
++        nonlocal running, peak
++        with slots:
++            with lock:
++                running += 1
++                peak = max(peak, running)
++            time.sleep(0.03)
++            with lock:
++                running -= 1
++
++    threads = [threading.Thread(target=work) for _ in range(12)]
++    [t.start() for t in threads]
++    [t.join() for t in threads]
++    assert peak == 2 and running == 0
++
++
++def test_slots_release_when_the_body_raises():
++    slots = Slots(lambda: 1)
++    try:
++        with slots:
++            raise RuntimeError("boom")
++    except RuntimeError:
++        pass
++    done = []
++    t = threading.Thread(target=lambda: (slots.__enter__(), done.append(1), slots.__exit__(None, None, None)))
++    t.start()
++    t.join(timeout=2)
++    assert done == [1]
++
++
++def test_size_is_read_lazily_and_never_below_one():
++    calls = []
++    slots = Slots(lambda: calls.append(1) or 0)
++    assert calls == []
++    with slots:
++        pass
++    assert calls == [1]
+diff --git a/backend/tests/test_dashboard_api.py b/backend/tests/test_dashboard_api.py
+index 7352229..ad2edaa 100644
+--- a/backend/tests/test_dashboard_api.py
++++ b/backend/tests/test_dashboard_api.py
+@@ -57,10 +57,35 @@ def test_summary_uses_real_loan_rows(client):
+     sek = body["loans"][0]
+     assert sek["currency"] == "SEK" and sek["active_loans"] == 1 and sek["overdue_loans"] == 0
+     assert sek["total_lent"] == "1200.00" and sek["outstanding_principal"] == "1112.00"
++    assert sek["unapplied_payments"] == "0.00"
+     assert body["paper"]["cash"] == "1000.00"
+     assert body["transactions"][0]["label"] == "Payment from Test Borrower"
+ 
+ 
++def test_summary_never_includes_another_users_rows(client):
++    with client.Session() as s:
++        other = s.scalar(select(User.id).where(User.email == "user@example.com"))
++        b = Borrower(user_id=other, name="Other Borrower")
++        s.add(b)
++        s.flush()
++        loan = Loan(
++            user_id=other, borrower_id=b.id, principal=D("5000.00"), annual_interest_rate=D("5"),
++            currency="USD", start_date=date(2025, 1, 1), maturity_date=date(2027, 1, 1),
++            repayment_frequency="monthly", amortization_method="annuity",
++        )
++        s.add(loan)
++        s.flush()
++        s.add(LoanPayment(loan_id=loan.id, paid_on=date(2025, 2, 1), amount=D("100.00")))
++        s.add(PaperAccount(user_id=other, name="Theirs", starting_cash=D("777"), cash_balance=D("777")))
++        s.add(Notification(user_id=other, kind="loan", title="Theirs"))
++        s.commit()
++    login(client)  # the admin owns none of the rows above
++    body = client.get("/api/dashboard/summary").json()
++    assert body["loans"] == [] and body["transactions"] == []
++    assert body["paper"]["accounts"] == 0 and body["paper"]["cash"] == "0.00"
++    assert body["notifications"] == {"unread": 0, "latest": []}
++
++
+ def test_layout_defaults_roundtrip_and_validation(client):
+     headers = login_csrf(client)
+     default = client.get("/api/settings/dashboard-layout").json()["widgets"]
+diff --git a/backend/tests/test_portfolio.py b/backend/tests/test_portfolio.py
+index cf22316..dc7ebec 100644
+--- a/backend/tests/test_portfolio.py
++++ b/backend/tests/test_portfolio.py
+@@ -36,3 +36,14 @@ def test_loan_without_schedule_falls_back_to_principal_minus_payments():
+     snap = LoanSnapshot(object(), "SEK", D("1000"), [], [D("300"), D("900")])
+     (t,) = summarize_loans([snap], TODAY)
+     assert t.outstanding_principal == D("0.00") and t.overdue_loans == 0
++
++
++def test_overpayment_is_reported_not_dropped():
++    over = _loan(paid=["99999"])  # far more than the schedule asks for
++    no_schedule = LoanSnapshot(object(), "SEK", D("1000"), [], [D("1300")])
++    (t,) = summarize_loans([over, no_schedule], TODAY)
++    exact_total = sum(i.total for i in over.schedule)
++    assert t.outstanding_principal == D("0.00") and t.overdue_loans == 0
++    assert t.unapplied_payments == (D("99999") - exact_total + D("300")).quantize(D("0.01"))
++    (clean,) = summarize_loans([_loan()], TODAY)
++    assert clean.unapplied_payments == D("0.00")
+diff --git a/backend/tests/test_ratelimit.py b/backend/tests/test_ratelimit.py
+index b83f9cc..6afa1dd 100644
+--- a/backend/tests/test_ratelimit.py
++++ b/backend/tests/test_ratelimit.py
+@@ -29,3 +29,45 @@ def test_reset_clears_key():
+     assert lim.is_blocked("a")
+     lim.reset("a")
+     assert not lim.is_blocked("a")
++
++
++def test_try_record_counts_until_the_limit_then_refuses_without_counting():
++    c = Clock()
++    lim = SlidingWindowLimiter(2, 60, clock=c)
++    assert lim.try_record("a") and lim.try_record("a")
++    assert not lim.try_record("a") and not lim.try_record("a")
++    assert lim.retry_after("a") == 60
++    c.t = 61  # refused attempts were not counted, so the window drains on schedule
++    assert lim.try_record("a")
++
++
++def test_try_record_is_atomic_across_threads():
++    import threading
++
++    lim = SlidingWindowLimiter(5, 900)
++    barrier = threading.Barrier(40)
++    allowed = []
++
++    def attempt():
++        barrier.wait()
++        if lim.try_record("victim"):
++            allowed.append(1)
++
++    threads = [threading.Thread(target=attempt) for _ in range(40)]
++    [t.start() for t in threads]
++    [t.join() for t in threads]
++    assert len(allowed) == 5
++
++
++def test_tracked_keys_stay_bounded_and_expired_keys_go_first():
++    c = Clock()
++    lim = SlidingWindowLimiter(1, 60, clock=c, max_keys=10)
++    for i in range(10):
++        lim.record(f"old{i}")
++    c.t = 61  # all ten have expired
++    lim.record("fresh")
++    assert set(lim._events) == {"fresh"}
++    for i in range(100):  # a flood of live keys cannot grow the table past the cap
++        lim.record(f"flood{i}")
++        assert len(lim._events) <= 10
++    assert lim.is_blocked("flood99")  # the newest keys are the ones kept
+diff --git a/backend/tests/test_risk.py b/backend/tests/test_risk.py
+index 9ee9d2b..7d16cbf 100644
+--- a/backend/tests/test_risk.py
++++ b/backend/tests/test_risk.py
+@@ -12,16 +12,33 @@ def _allocs(paid):
+ 
+ 
+ def test_on_time_is_low():
+-    r = assess_loan(_allocs("0"), date(2026, 1, 1), D("1200"), D("5000"))
++    r = assess_loan(_allocs("0"), date(2026, 1, 1), D("1200"), D("5000"), 4)
+     assert r.level == "low" and r.triggers == []
+ 
+ 
+ def test_overdue_thresholds():
+-    assert assess_loan(_allocs("0"), date(2026, 2, 10), D("1200"), D("5000")).level == "medium"
+-    assert assess_loan(_allocs("0"), date(2026, 4, 15), D("1200"), D("5000")).level == "high"
++    # First installment is due Feb 1: grace period, then medium at 7 days, high at 30.
++    assert assess_loan(_allocs("0"), date(2026, 2, 2), D("1200"), D("5000"), 4).level == "low"
++    assert assess_loan(_allocs("0"), date(2026, 2, 7), D("1200"), D("5000"), 4).level == "low"
++    assert assess_loan(_allocs("0"), date(2026, 2, 8), D("1200"), D("5000"), 4).level == "medium"
++    assert assess_loan(_allocs("0"), date(2026, 3, 3), D("1200"), D("5000"), 4).level == "high"
++
++
++def test_two_installments_past_due_is_medium_even_when_each_is_only_days_late():
++    # Feb 1 and Mar 1 both unpaid on Mar 3: 30 and 2 days late.
++    r = assess_loan(_allocs("0"), date(2026, 3, 3), D("1200"), D("5000"), 4)
++    assert any("2 installments" in t for t in r.triggers)
++    r = assess_loan(_allocs("0"), date(2026, 4, 15), D("1200"), D("5000"), 4)
++    assert r.level == "high" and any("3 installments" in t for t in r.triggers)
+ 
+ 
+ def test_concentration_flag_and_disclaimer():
+-    r = assess_loan(_allocs("0"), date(2026, 1, 1), D("1200"), D("1500"))
++    r = assess_loan(_allocs("0"), date(2026, 1, 1), D("1200"), D("1500"), 3)
+     assert r.level == "medium" and "total outstanding" in r.triggers[0]
+     assert "not a prediction" in r.disclaimer
++
++
++def test_concentration_is_ignored_for_very_small_portfolios():
++    for loans, total in ((1, "1200"), (2, "2400")):
++        r = assess_loan(_allocs("0"), date(2026, 1, 1), D("1200"), D(total), loans)
++        assert r.level == "low" and r.triggers == [], loans
+diff --git a/frontend/src/App.tsx b/frontend/src/App.tsx
+index 44a3985..248829b 100644
+--- a/frontend/src/App.tsx
++++ b/frontend/src/App.tsx
+@@ -3,6 +3,7 @@ import { BrowserRouter, Navigate, Outlet, Route, Routes, useLocation } from "rea
+ import { AuthProvider, useAuth } from "./auth/AuthContext";
+ import { AppShell } from "./components/layout/AppShell";
+ import { ThemeProvider } from "./theme/ThemeContext";
++import Account from "./pages/Account";
+ import Admin from "./pages/Admin";
+ import CommandCenter from "./pages/CommandCenter";
+ import ComingSoon from "./pages/ComingSoon";
+@@ -42,6 +43,7 @@ export default function App() {
+                 <Route path="paper" element={<ComingSoon title="Paper Trading" phase={6}>Simulated orders and positions will live here. No real orders are ever placed.</ComingSoon>} />
+                 <Route path="analytics" element={<ComingSoon title="Analytics" phase={7}>Loan, portfolio and cash-flow reports with CSV and PDF export will be here.</ComingSoon>} />
+                 <Route path="assistant" element={<ComingSoon title="Assistant" phase={8}>An optional assistant that explains your data. It only sees your data if you allow it.</ComingSoon>} />
++                <Route path="account" element={<Account />} />
+                 <Route element={<RequireAdmin />}>
+                   <Route path="admin" element={<Admin />} />
+                 </Route>
+diff --git a/frontend/src/auth/AuthContext.tsx b/frontend/src/auth/AuthContext.tsx
+index 66fa047..1435073 100644
+--- a/frontend/src/auth/AuthContext.tsx
++++ b/frontend/src/auth/AuthContext.tsx
+@@ -1,5 +1,5 @@
+ import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+-import { api, ApiError, setCsrfToken } from "../lib/api";
++import { api, ApiError, setCsrfToken, setUnauthorizedHandler } from "../lib/api";
+ 
+ export interface User {
+   id: string;
+@@ -23,6 +23,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
+   const [user, setUser] = useState<User | null>(null);
+   const [loading, setLoading] = useState(true);
+ 
++  useEffect(() => {
++    setUnauthorizedHandler(() => { setCsrfToken(null); setUser(null); });
++    return () => setUnauthorizedHandler(null);
++  }, []);
++
+   useEffect(() => {
+     api<SessionResponse>("/api/auth/me")
+       .then((s) => { setCsrfToken(s.csrf_token); setUser(s.user); })
+diff --git a/frontend/src/components/layout/Topbar.tsx b/frontend/src/components/layout/Topbar.tsx
+index 103a7bd..4704d12 100644
+--- a/frontend/src/components/layout/Topbar.tsx
++++ b/frontend/src/components/layout/Topbar.tsx
+@@ -1,9 +1,9 @@
+ import { useEffect, useRef, useState } from "react";
+ import { useNavigate } from "react-router-dom";
+-import { Bell, LogOut, Menu, Moon, Search, Sun } from "lucide-react";
++import { Bell, KeyRound, LogOut, Menu, Moon, Search, Sun } from "lucide-react";
+ import { useAuth } from "../../auth/AuthContext";
+ import { useTheme } from "../../theme/ThemeContext";
+-import { api } from "../../lib/api";
++import { api, ApiError } from "../../lib/api";
+ import { formatDateTime } from "../../lib/format";
+ import type { AppNotification } from "../../lib/types";
+ import { useApi } from "../../lib/useApi";
+@@ -31,15 +31,28 @@ export function Topbar({ onOpenMenu }: { onOpenMenu: () => void }) {
+   const bell = usePopover();
+   const notes = useApi<{ unread: number; items: AppNotification[] }>("/api/notifications?limit=10");
+   const unread = notes.data?.unread ?? 0;
++  const [markError, setMarkError] = useState<string | null>(null);
++
++  // Keep the unread dot current without a page reload. Reloading also notices an expired session.
++  const reloadNotes = notes.reload;
++  useEffect(() => {
++    const id = window.setInterval(reloadNotes, 60000);
++    return () => window.clearInterval(id);
++  }, [reloadNotes]);
+ 
+   function toggleBell() {
+-    if (!bell.open) notes.reload();
++    if (!bell.open) reloadNotes();
+     bell.setOpen(!bell.open);
+   }
+ 
+   async function markAllRead() {
+-    await api("/api/notifications/read-all", { method: "POST" });
+-    notes.reload();
++    setMarkError(null);
++    try {
++      await api("/api/notifications/read-all", { method: "POST" });
++      reloadNotes();
++    } catch (err) {
++      setMarkError(err instanceof ApiError ? err.message : "Could not mark notifications as read.");
++    }
+   }
+   const profile = usePopover();
+ 
+@@ -94,7 +107,7 @@ export function Topbar({ onOpenMenu }: { onOpenMenu: () => void }) {
+                   <button className="text-xs text-cyan hover:underline" onClick={() => void markAllRead()}>Mark all read</button>
+                 )}
+               </div>
+-              {notes.error && <p className="mt-2 text-danger">{notes.error}</p>}
++              {(markError ?? notes.error) && <p className="mt-2 text-danger">{markError ?? notes.error}</p>}
+               {!notes.error && (notes.data?.items.length ?? 0) === 0 && (
+                 <p className="mt-2 text-dim">You're all caught up. Alerts about overdue loans and other changes will show here.</p>
+               )}
+@@ -124,6 +137,10 @@ export function Topbar({ onOpenMenu }: { onOpenMenu: () => void }) {
+                 <p className="font-medium">{user?.display_name}</p>
+                 <p className="truncate text-dim">{user?.email}</p>
+               </div>
++              <button className="flex w-full items-center gap-2 rounded-lg px-3 py-2 hover:bg-white/10"
++                onClick={() => { profile.setOpen(false); navigate("/account"); }}>
++                <KeyRound className="h-4 w-4" aria-hidden />Account and password
++              </button>
+               <button className="flex w-full items-center gap-2 rounded-lg px-3 py-2 hover:bg-white/10" onClick={() => void logout()}>
+                 <LogOut className="h-4 w-4" aria-hidden />Sign out
+               </button>
+diff --git a/frontend/src/components/widgets/LoansWidget.tsx b/frontend/src/components/widgets/LoansWidget.tsx
+index ffc66df..216464c 100644
+--- a/frontend/src/components/widgets/LoansWidget.tsx
++++ b/frontend/src/components/widgets/LoansWidget.tsx
+@@ -1,7 +1,7 @@
+ import { Link } from "react-router-dom";
+ import { formatMoney } from "../../lib/format";
+ import type { DashboardSummary } from "../../lib/types";
+-import { Empty, Row, WidgetFrame } from "./WidgetFrame";
++import { Empty, Row, Unavailable, WidgetFrame } from "./WidgetFrame";
+ 
+ export function LoansWidget({ data }: { data: DashboardSummary }) {
+   const { loans } = data;
+@@ -23,9 +23,16 @@ export function LoansWidget({ data }: { data: DashboardSummary }) {
+                 {t.overdue_loans > 0 && (
+                   <Row label="Amount overdue" value={formatMoney(t.overdue_amount, t.currency)} tone="danger" />
+                 )}
++                {Number(t.unapplied_payments) > 0 && (
++                  <Row label="Paid beyond schedule" value={formatMoney(t.unapplied_payments, t.currency)} />
++                )}
+               </dl>
+             </div>
+           ))}
++          <Unavailable>
++            Remaining interest follows each loan's original schedule. Early repayments reduce principal
++            but do not recalculate the interest still to come.
++          </Unavailable>
+         </div>
+       )}
+     </WidgetFrame>
+diff --git a/frontend/src/components/widgets/TransactionsWidget.tsx b/frontend/src/components/widgets/TransactionsWidget.tsx
+index 3e08859..0b8c1f7 100644
+--- a/frontend/src/components/widgets/TransactionsWidget.tsx
++++ b/frontend/src/components/widgets/TransactionsWidget.tsx
+@@ -16,7 +16,7 @@ export function TransactionsWidget({ data }: { data: DashboardSummary }) {
+                   {t.label}
+                   {t.simulated && <span className="ml-2 rounded-full border border-violet/40 px-1.5 py-0.5 text-xs text-violet">Simulated</span>}
+                 </p>
+-                <p className="text-xs text-dim">{formatDate(t.occurred_at)}</p>
++                <p className="text-xs text-dim">{formatDate(t.occurred_at, t.kind === "loan_payment" ? "UTC" : undefined)}</p>
+               </div>
+               <span className="num shrink-0">{formatMoney(t.amount, t.currency)}</span>
+             </li>
+diff --git a/frontend/src/lib/api.ts b/frontend/src/lib/api.ts
+index a4c53a4..2c14c4b 100644
+--- a/frontend/src/lib/api.ts
++++ b/frontend/src/lib/api.ts
+@@ -3,6 +3,13 @@ const BASE = import.meta.env.VITE_API_URL ?? "";
+ let csrfToken: string | null = null;
+ export const setCsrfToken = (t: string | null) => { csrfToken = t; };
+ 
++// Called when a request that needs a session comes back 401 (the session expired or was revoked),
++// so the app can drop its signed-in state and send the user to the sign-in page.
++let onUnauthorized: (() => void) | null = null;
++export const setUnauthorizedHandler = (fn: (() => void) | null) => { onUnauthorized = fn; };
++// 401 here means a wrong password or "no session yet", not an expired session.
++const SESSION_PROBES = new Set(["/api/auth/login", "/api/auth/me"]);
++
+ export class ApiError extends Error {
+   status: number;
+   constructor(status: number, message: string) {
+@@ -39,6 +46,7 @@ export async function api<T>(path: string, options: { method?: string; body?: un
+   } catch {
+     throw new ApiError(0, "Cannot reach the server. Check your connection and try again.");
+   }
++  if (res.status === 401 && !SESSION_PROBES.has(path)) onUnauthorized?.();
+   if (res.status === 204) return undefined as T;
+   const body = await res.json().catch(() => null);
+   if (!res.ok) throw new ApiError(res.status, describeError(body, `Request failed (${res.status}).`));
+diff --git a/frontend/src/lib/format.ts b/frontend/src/lib/format.ts
+index 56ddfd1..1b7c41a 100644
+--- a/frontend/src/lib/format.ts
++++ b/frontend/src/lib/format.ts
+@@ -12,8 +12,10 @@ export function formatDateTime(iso: string): string {
+   return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(iso));
+ }
+ 
+-export function formatDate(iso: string): string {
+-  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(new Date(iso));
++// Pass timeZone "UTC" for a calendar date the API sends as midnight UTC, so it does not shift a day
++// for viewers west of Greenwich.
++export function formatDate(iso: string, timeZone?: string): string {
++  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeZone }).format(new Date(iso));
+ }
+ 
+ export const isNegative = (value: string): boolean => Number(value) < 0;
+diff --git a/frontend/src/lib/password.ts b/frontend/src/lib/password.ts
+new file mode 100644
+index 0000000..dcd642c
+--- /dev/null
++++ b/frontend/src/lib/password.ts
+@@ -0,0 +1,18 @@
++export const MIN_PASSWORD_LENGTH = 12;
++
++// No look-alike characters (0/O, 1/l/I) so a generated password can be read out or typed from a note.
++const ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
++
++/** A random password from the browser's secure generator, without modulo bias. */
++export function generatePassword(length = 20): string {
++  const limit = 256 - (256 % ALPHABET.length); // bytes at or above this would favour early characters
++  const out: string[] = [];
++  while (out.length < length) {
++    const bytes = new Uint8Array(32);
++    crypto.getRandomValues(bytes);
++    for (const b of bytes) {
++      if (b < limit && out.length < length) out.push(ALPHABET[b % ALPHABET.length]);
++    }
++  }
++  return out.join("");
++}
+diff --git a/frontend/src/lib/types.ts b/frontend/src/lib/types.ts
+index 1475499..04c7655 100644
+--- a/frontend/src/lib/types.ts
++++ b/frontend/src/lib/types.ts
+@@ -10,6 +10,7 @@ export interface LoanTotals {
+   outstanding_principal: string;
+   remaining_interest: string;
+   overdue_amount: string;
++  unapplied_payments: string;
+ }
+ 
+ export interface PaperSummary {
+diff --git a/frontend/src/pages/Account.tsx b/frontend/src/pages/Account.tsx
+new file mode 100644
+index 0000000..9406776
+--- /dev/null
++++ b/frontend/src/pages/Account.tsx
+@@ -0,0 +1,68 @@
++import { useState, type FormEvent } from "react";
++import { Loader2 } from "lucide-react";
++import { useAuth } from "../auth/AuthContext";
++import { Field } from "../components/ui/Field";
++import { api, ApiError, setCsrfToken } from "../lib/api";
++import { MIN_PASSWORD_LENGTH } from "../lib/password";
++
++export default function Account() {
++  const { user } = useAuth();
++  const [current, setCurrent] = useState("");
++  const [next, setNext] = useState("");
++  const [repeat, setRepeat] = useState("");
++  const [busy, setBusy] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++  const [done, setDone] = useState(false);
++
++  async function submit(e: FormEvent) {
++    e.preventDefault();
++    setError(null);
++    setDone(false);
++    if (next !== repeat) {
++      setError("The new password and its repeat do not match.");
++      return;
++    }
++    setBusy(true);
++    try {
++      // The server replaces every session, this one included, and returns the new CSRF token.
++      const s = await api<{ csrf_token: string }>("/api/auth/password", {
++        method: "POST",
++        body: { current_password: current, new_password: next },
++      });
++      setCsrfToken(s.csrf_token);
++      setCurrent("");
++      setNext("");
++      setRepeat("");
++      setDone(true);
++    } catch (err) {
++      setError(err instanceof ApiError ? err.message : "Could not change the password. Try again.");
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  return (
++    <section>
++      <h1 className="text-2xl font-semibold">Account</h1>
++      <p className="mt-1 text-sm text-dim">{user?.display_name} · {user?.email}</p>
++
++      <form onSubmit={(e) => void submit(e)} className="glass mt-6 w-full max-w-md rounded-2xl p-6">
++        <h2 className="font-semibold">Change password</h2>
++        <p className="mt-1 text-sm text-dim">You stay signed in here. Every other device is signed out.</p>
++        <Field className="mt-5" label="Current password" type="password" autoComplete="current-password" required
++          value={current} onChange={(e) => setCurrent(e.target.value)} />
++        <Field className="mt-4" label="New password" type="password" autoComplete="new-password" required
++          minLength={MIN_PASSWORD_LENGTH} hint={`At least ${MIN_PASSWORD_LENGTH} characters.`}
++          value={next} onChange={(e) => setNext(e.target.value)} />
++        <Field className="mt-4" label="Repeat new password" type="password" autoComplete="new-password" required
++          value={repeat} onChange={(e) => setRepeat(e.target.value)} />
++        {error && <p role="alert" className="mt-4 text-sm text-danger">{error}</p>}
++        {done && <p role="status" className="mt-4 text-sm text-cyan">Password changed. Other devices were signed out.</p>}
++        <button className="btn btn-primary mt-6 w-full" disabled={busy || !current || !next || !repeat}>
++          {busy && <Loader2 className="h-4 w-4 animate-spin" aria-hidden />}
++          {busy ? "Saving" : "Change password"}
++        </button>
++      </form>
++    </section>
++  );
++}
+diff --git a/frontend/src/pages/Admin.tsx b/frontend/src/pages/Admin.tsx
+index dbb3bda..7ab39d6 100644
+--- a/frontend/src/pages/Admin.tsx
++++ b/frontend/src/pages/Admin.tsx
+@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState, type FormEvent } from "react";
+ import { Field } from "../components/ui/Field";
+ import { api, ApiError } from "../lib/api";
+ import { useAuth, type User } from "../auth/AuthContext";
++import { generatePassword, MIN_PASSWORD_LENGTH } from "../lib/password";
+ 
+ export default function Admin() {
+   const { user: me } = useAuth();
+@@ -9,6 +10,11 @@ export default function Admin() {
+   const [error, setError] = useState<string | null>(null);
+   const [form, setForm] = useState({ email: "", display_name: "", password: "", is_admin: false });
+   const [busy, setBusy] = useState(false);
++  const [resetFor, setResetFor] = useState<User | null>(null);
++  const [resetPw, setResetPw] = useState("");
++  const [reveal, setReveal] = useState(false);
++  const [resetBusy, setResetBusy] = useState(false);
++  const [notice, setNotice] = useState<string | null>(null);
+ 
+   const load = useCallback(() => {
+     api<User[]>("/api/admin/users").then(setUsers).catch((e) => setError(e.message));
+@@ -40,10 +46,37 @@ export default function Admin() {
+     }
+   }
+ 
++  function openReset(u: User) {
++    setResetFor(u);
++    setResetPw("");
++    setReveal(false);
++    setNotice(null);
++    setError(null);
++  }
++
++  async function submitReset(e: FormEvent) {
++    e.preventDefault();
++    if (!resetFor) return;
++    setResetBusy(true);
++    setError(null);
++    try {
++      await api(`/api/admin/users/${resetFor.id}/password`, { method: "POST", body: { new_password: resetPw } });
++      setNotice(`Password reset for ${resetFor.display_name}. They were signed out everywhere. Give them the new password privately.`);
++      setResetFor(null);
++      setResetPw("");
++      setReveal(false);
++    } catch (err) {
++      setError(err instanceof ApiError ? err.message : "Could not reset the password.");
++    } finally {
++      setResetBusy(false);
++    }
++  }
++
+   return (
+     <section>
+       <h1 className="text-2xl font-semibold">Users</h1>
+       {error && <p role="alert" className="mt-4 text-sm text-danger">{error}</p>}
++      {notice && <p role="status" className="mt-4 text-sm text-cyan">{notice}</p>}
+       <div className="mt-6 grid gap-6 xl:grid-cols-[1fr_22rem]">
+         <div className="glass overflow-x-auto rounded-2xl">
+           <table className="w-full text-left text-sm">
+@@ -59,9 +92,14 @@ export default function Admin() {
+                   <td className="p-4">{u.is_admin ? "Administrator" : "Member"}{!u.is_active && " (inactive)"}</td>
+                   <td className="p-4 text-right">
+                     {u.id !== me?.id && (
+-                      <button className="btn btn-ghost !py-1.5 text-xs" onClick={() => toggle(u)}>
+-                        {u.is_active ? "Deactivate" : "Reactivate"}
+-                      </button>
++                      <div className="flex justify-end gap-2">
++                        <button className="btn btn-ghost !py-1.5 text-xs" onClick={() => openReset(u)}>
++                          Reset password
++                        </button>
++                        <button className="btn btn-ghost !py-1.5 text-xs" onClick={() => toggle(u)}>
++                          {u.is_active ? "Deactivate" : "Reactivate"}
++                        </button>
++                      </div>
+                     )}
+                   </td>
+                 </tr>
+@@ -70,6 +108,36 @@ export default function Admin() {
+           </table>
+         </div>
+ 
++        <div className="space-y-6">
++        {resetFor && (
++          <form onSubmit={(e) => void submitReset(e)} className="glass h-fit rounded-2xl p-5">
++            <h2 className="font-semibold">Reset password</h2>
++            <p className="mt-1 text-sm text-dim">{resetFor.display_name} ({resetFor.email}) will be signed out everywhere.</p>
++            <Field className="mt-4" label="New password" type={reveal ? "text" : "password"} required
++              minLength={MIN_PASSWORD_LENGTH} autoComplete="new-password"
++              hint="Copy it before saving. It is not shown again."
++              value={resetPw} onChange={(e) => setResetPw(e.target.value)} />
++            <div className="mt-3 flex gap-2">
++              <button type="button" className="btn btn-ghost !py-1.5 text-xs"
++                onClick={() => { setResetPw(generatePassword()); setReveal(true); }}>
++                Generate
++              </button>
++              {reveal && resetPw && (
++                <button type="button" className="btn btn-ghost !py-1.5 text-xs"
++                  onClick={() => void navigator.clipboard?.writeText(resetPw).catch(() => undefined)}>
++                  Copy
++                </button>
++              )}
++            </div>
++            <div className="mt-5 flex gap-2">
++              <button className="btn btn-primary flex-1" disabled={resetBusy || resetPw.length < MIN_PASSWORD_LENGTH}>
++                Reset password
++              </button>
++              <button type="button" className="btn btn-ghost" onClick={() => setResetFor(null)}>Cancel</button>
++            </div>
++          </form>
++        )}
++
+         <form onSubmit={create} className="glass h-fit rounded-2xl p-5">
+           <h2 className="font-semibold">Add a user</h2>
+           <Field className="mt-4" label="Name" required value={form.display_name}
+@@ -86,6 +154,7 @@ export default function Admin() {
+           </label>
+           <button className="btn btn-primary mt-5 w-full" disabled={busy}>Create user</button>
+         </form>
++        </div>
+       </div>
+     </section>
+   );
+diff --git a/render.yaml b/render.yaml
+index 4203e57..54fd614 100644
+--- a/render.yaml
++++ b/render.yaml
+@@ -19,6 +19,10 @@ services:
+         generateValue: true
+       - key: CORS_ORIGINS
+         value: https://app.xvortex.se
++      - key: TRUSTED_PROXY_HOPS
++        value: "1"           # proxies that append to X-Forwarded-For; check the README after first deploy
++      - key: PASSWORD_HASH_CONCURRENCY
++        value: "2"           # password hashes allowed at once (about 64 MiB each; the instance has 512 MB)
+       - key: ADMIN_EMAIL
+         sync: false          # first administrator (used only if no users exist yet)
+       - key: ADMIN_PASSWORD
+@@ -28,7 +32,7 @@ services:
+     name: xvortex-app
+     runtime: static
+     rootDir: frontend
+-    buildCommand: npm install && npm run build
++    buildCommand: (npm ci || npm install) && npm run build   # npm ci once package-lock.json is committed
+     staticPublishPath: dist
+     envVars:
+       - key: VITE_API_URL

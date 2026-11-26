@@ -1,0 +1,1341 @@
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p5/.env.example xvortex/.env.example
+--- a/.env.example	2026-11-26 22:47:32.000000000 +0100
++++ b/.env.example	2026-11-26 23:49:10.580596621 +0100
+@@ -15,3 +15,8 @@
+ # Password must be 12+ characters. Remove ADMIN_PASSWORD from the environment after your first login.
+ ADMIN_EMAIL=
+ ADMIN_PASSWORD=
++
++# Market data (optional). Free key: https://www.alphavantage.co/support/#api-key
++ALPHAVANTAGE_API_KEY=
++ALPHAVANTAGE_DAILY_LIMIT=20
++MARKET_CACHE_HOURS=12
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p5/README.md xvortex/README.md
+--- a/README.md	2026-11-26 23:39:43.000000000 +0100
++++ b/README.md	2026-11-26 23:49:03.644309986 +0100
+@@ -3,8 +3,8 @@
+ Personal financial intelligence platform: loan management, market monitoring, paper trading
+ (simulated only, never real orders), analytics and an optional AI assistant.
+ 
+-**Status: phase 4 of 10 (Loans).** Market, Paper Trading, Analytics and the Assistant arrive in
+-phases 5 to 8; until then their pages say so and show no sample data.
++**Status: phase 5 of 10 (Market).** Paper Trading, Analytics and the Assistant arrive in
++phases 6 to 8; until then their pages say so and show no sample data.
+ 
+ ## Repository layout
+ 
+@@ -127,6 +127,22 @@
+ - Not yet: editing the terms of a saved loan (create a new loan instead), recalculating interest after early
+   repayment, and CSV export (phase 7).
+ 
++## Market (phase 5)
++
++- Prices come from Alpha Vantage as **end-of-day** closes (the free plan serves the latest 100 trading days). Nothing
++  is live, and the page says so. Set `ALPHAVANTAGE_API_KEY` to turn prices on; without it watchlists still work and
++  prices show as unavailable. Nothing is ever estimated.
++- The free plan allows 25 requests a day and 5 a minute, so prices are saved in `market_data_cache`, shared by all
++  users, and reused for `MARKET_CACHE_HOURS` (12). Every provider request is counted before it is made, against
++  `ALPHAVANTAGE_DAILY_LIMIT` (20, per UTC day; the provider's own day may roll over at another time, so the
++  default leaves headroom). When the budget is used up or the provider fails, the last saved prices are shown
++  marked out of date.
++- Listing watchlists never calls the provider. Loading a chart does, once per symbol per cache period, and only for
++  symbols on one of your watchlists. "Refresh prices" is limited to once per 15 minutes per symbol.
++- SMA(20), SMA(50) and Wilder RSI(14) are calculated here from the saved closes. They describe past prices and are
++  not advice or predictions. A table view of the same numbers is one click away from the chart.
++- Not yet: symbol search, intraday data, valuing paper positions (phase 6) and news.
++
+ ## Design notes
+ 
+ - Money, prices and quantities are `NUMERIC`/`Decimal`, never floats.
+@@ -139,5 +155,5 @@
+ 
+ ## Roadmap
+ 
+-1 Architecture and database · 2 Auth and design system · 3 Command Center · **4 Loans (this commit)** ·
++1 Architecture and database · 2 Auth and design system · 3 Command Center · 4 Loans · **5 Market (this commit)** ·
+ 5 Market intelligence · 6 Paper trading · 7 Analytics · 8 AI assistant · 9 Security and tests · 10 Final deploy
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p5/backend/app/api/market.py xvortex/backend/app/api/market.py
+--- a/backend/app/api/market.py	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/app/api/market.py	2026-11-26 23:47:22.608563347 +0100
+@@ -0,0 +1,160 @@
++import uuid
++from datetime import datetime, timezone
++from decimal import ROUND_HALF_UP, Decimal
++
++from fastapi import APIRouter, Depends, HTTPException
++from sqlalchemy import func, select
++from sqlalchemy.exc import IntegrityError
++from sqlalchemy.orm import Session
++
++from app.api.deps import PRIVATE, current_user
++from app.api.market_schemas import (
++    BarOut, DailyOut, InstrumentIn, InstrumentOut, MarketStatus, SYMBOL_RE, WatchlistIn, WatchlistOut,
++)
++from app.core.config import get_settings
++from app.db import get_db
++from app.models import MarketDataCache, User, Watchlist, WatchlistInstrument
++from app.services.market import service
++from app.services.market.indicators import rsi, sma
++
++router = APIRouter(prefix="/api/market", tags=["market"], dependencies=PRIVATE)
++
++MAX_WATCHLISTS = 20
++MAX_INSTRUMENTS = 30
++STATUS_FOR = {"not_configured": 503, "budget": 429, "rate_limit": 429, "invalid_symbol": 404, "auth": 502, "unavailable": 502}
++
++
++def _owned(db: Session, user: User, watchlist_id: uuid.UUID) -> Watchlist:
++    w = db.scalar(select(Watchlist).where(Watchlist.id == watchlist_id, Watchlist.user_id == user.id))
++    if w is None:
++        raise HTTPException(404, "Watchlist not found.")
++    return w
++
++
++def _out(db: Session, lists: list[Watchlist]) -> list[WatchlistOut]:
++    """Built from saved prices only: listing watchlists never spends a provider request."""
++    ids = [w.id for w in lists]
++    rows = db.scalars(
++        select(WatchlistInstrument).where(WatchlistInstrument.watchlist_id.in_(ids)).order_by(WatchlistInstrument.symbol)
++    ).all() if ids else []
++    symbols = {r.symbol for r in rows}
++    caches = {}
++    if symbols:
++        for c in db.scalars(select(MarketDataCache).where(MarketDataCache.cache_key.in_([service.cache_key(s) for s in symbols]))):
++            caches[c.symbol] = c
++    quotes = {}
++    for sym, c in caches.items():
++        bars = service.decode_bars(c.payload)
++        if not bars:
++            continue
++        last = bars[-1]
++        change = None
++        if len(bars) > 1 and bars[-2].close != 0:
++            change = ((last.close - bars[-2].close) / bars[-2].close * 100).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
++        quotes[sym] = (last.close, change, last.day, service._utc(c.fetched_at))
++    by_list: dict = {w.id: [] for w in lists}
++    for r in rows:
++        q = quotes.get(r.symbol)
++        by_list[r.watchlist_id].append(InstrumentOut(
++            symbol=r.symbol, name=r.name, last_close=q[0] if q else None, change_pct=q[1] if q else None,
++            as_of=q[2] if q else None, fetched_at=q[3] if q else None,
++        ))
++    return [WatchlistOut(id=str(w.id), name=w.name, instruments=by_list[w.id]) for w in lists]
++
++
++@router.get("/status", response_model=MarketStatus)
++def status(db: Session = Depends(get_db)):
++    s = get_settings()
++    return MarketStatus(
++        configured=bool(s.alphavantage_api_key), budget_used=service.budget_used(db, datetime.now(timezone.utc)),
++        budget_limit=s.alphavantage_daily_limit,
++    )
++
++
++@router.get("/watchlists", response_model=list[WatchlistOut])
++def list_watchlists(user: User = Depends(current_user), db: Session = Depends(get_db)):
++    lists = list(db.scalars(select(Watchlist).where(Watchlist.user_id == user.id).order_by(func.lower(Watchlist.name))))
++    return _out(db, lists)
++
++
++@router.post("/watchlists", response_model=WatchlistOut, status_code=201)
++def create_watchlist(body: WatchlistIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
++    if (db.scalar(select(func.count(Watchlist.id)).where(Watchlist.user_id == user.id)) or 0) >= MAX_WATCHLISTS:
++        raise HTTPException(409, f"You can have at most {MAX_WATCHLISTS} watchlists.")
++    w = Watchlist(user_id=user.id, name=body.name)
++    db.add(w)
++    try:
++        db.commit()
++    except IntegrityError:
++        db.rollback()
++        raise HTTPException(409, "You already have a watchlist with that name.")
++    return _out(db, [w])[0]
++
++
++@router.patch("/watchlists/{watchlist_id}", response_model=WatchlistOut)
++def rename_watchlist(watchlist_id: uuid.UUID, body: WatchlistIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
++    w = _owned(db, user, watchlist_id)
++    w.name = body.name
++    try:
++        db.commit()
++    except IntegrityError:
++        db.rollback()
++        raise HTTPException(409, "You already have a watchlist with that name.")
++    return _out(db, [w])[0]
++
++
++@router.delete("/watchlists/{watchlist_id}", status_code=204)
++def delete_watchlist(watchlist_id: uuid.UUID, user: User = Depends(current_user), db: Session = Depends(get_db)):
++    db.delete(_owned(db, user, watchlist_id))
++    db.commit()
++
++
++@router.post("/watchlists/{watchlist_id}/instruments", response_model=WatchlistOut, status_code=201)
++def add_instrument(watchlist_id: uuid.UUID, body: InstrumentIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
++    w = _owned(db, user, watchlist_id)
++    if (db.scalar(select(func.count(WatchlistInstrument.id)).where(WatchlistInstrument.watchlist_id == w.id)) or 0) >= MAX_INSTRUMENTS:
++        raise HTTPException(409, f"A watchlist can hold at most {MAX_INSTRUMENTS} symbols.")
++    db.add(WatchlistInstrument(watchlist_id=w.id, symbol=body.symbol, name=body.name))
++    try:
++        db.commit()
++    except IntegrityError:
++        db.rollback()
++        raise HTTPException(409, "That symbol is already in this watchlist.")
++    return _out(db, [w])[0]
++
++
++@router.delete("/watchlists/{watchlist_id}/instruments/{symbol}", response_model=WatchlistOut)
++def remove_instrument(watchlist_id: uuid.UUID, symbol: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
++    w = _owned(db, user, watchlist_id)
++    inst = db.scalar(select(WatchlistInstrument).where(WatchlistInstrument.watchlist_id == w.id, WatchlistInstrument.symbol == symbol.upper()))
++    if inst is None:
++        raise HTTPException(404, "Symbol not found in this watchlist.")
++    db.delete(inst)
++    db.commit()
++    return _out(db, [w])[0]
++
++
++@router.get("/symbols/{symbol}/daily", response_model=DailyOut)
++def daily(symbol: str, refresh: bool = False, user: User = Depends(current_user), db: Session = Depends(get_db)):
++    """Only symbols on one of the caller's watchlists can be loaded, so the shared request budget is not
++    spent on arbitrary lookups."""
++    symbol = symbol.strip().upper()
++    if not SYMBOL_RE.match(symbol):
++        raise HTTPException(422, "Invalid symbol.")
++    listed = db.scalar(
++        select(WatchlistInstrument.id).join(Watchlist, Watchlist.id == WatchlistInstrument.watchlist_id)
++        .where(Watchlist.user_id == user.id, WatchlistInstrument.symbol == symbol).limit(1)
++    )
++    if listed is None:
++        raise HTTPException(404, "Add this symbol to a watchlist first.")
++    try:
++        d = service.get_daily(db, get_settings(), symbol, force=refresh)
++    except service.MarketUnavailable as exc:
++        raise HTTPException(STATUS_FOR.get(exc.kind, 502), str(exc))
++    closes = [b.close for b in d.bars]
++    return DailyOut(
++        symbol=symbol,
++        bars=[BarOut(date=b.day, open=b.open, high=b.high, low=b.low, close=b.close, volume=b.volume) for b in d.bars],
++        sma20=sma(closes, 20), sma50=sma(closes, 50), rsi14=rsi(closes, 14),
++        fetched_at=d.fetched_at, expires_at=d.expires_at, stale=d.stale, warning=d.warning,
++    )
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p5/backend/app/api/market_schemas.py xvortex/backend/app/api/market_schemas.py
+--- a/backend/app/api/market_schemas.py	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/app/api/market_schemas.py	2026-11-26 23:47:22.588342988 +0100
+@@ -0,0 +1,81 @@
++import re
++from datetime import date, datetime
++from decimal import Decimal
++
++from pydantic import BaseModel, Field, field_validator
++
++SYMBOL_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,15}$")
++
++
++class WatchlistIn(BaseModel):
++    name: str = Field(min_length=1, max_length=100)
++
++    @field_validator("name")
++    @classmethod
++    def _name(cls, v: str) -> str:
++        v = v.strip()
++        if not v:
++            raise ValueError("Name must not be blank.")
++        return v
++
++
++class InstrumentIn(BaseModel):
++    symbol: str = Field(min_length=1, max_length=16)
++    name: str | None = Field(default=None, max_length=200)
++
++    @field_validator("symbol")
++    @classmethod
++    def _symbol(cls, v: str) -> str:
++        v = v.strip().upper()
++        if not SYMBOL_RE.match(v):
++            raise ValueError("Use letters, digits, dots and dashes only, for example IBM or VOLV-B.ST.")
++        return v
++
++    @field_validator("name")
++    @classmethod
++    def _name(cls, v: str | None) -> str | None:
++        return (v.strip() or None) if v is not None else None
++
++
++class InstrumentOut(BaseModel):
++    symbol: str
++    name: str | None
++    last_close: Decimal | None  # from saved prices only; None until prices have been fetched
++    change_pct: Decimal | None  # last close against the one before it
++    as_of: date | None  # trading day of last_close
++    fetched_at: datetime | None
++
++
++class WatchlistOut(BaseModel):
++    id: str
++    name: str
++    instruments: list[InstrumentOut]
++
++
++class BarOut(BaseModel):
++    date: date
++    open: Decimal
++    high: Decimal
++    low: Decimal
++    close: Decimal
++    volume: int
++
++
++class DailyOut(BaseModel):
++    symbol: str
++    bars: list[BarOut]
++    sma20: list[Decimal | None]
++    sma50: list[Decimal | None]
++    rsi14: list[Decimal | None]
++    fetched_at: datetime
++    expires_at: datetime
++    stale: bool
++    warning: str | None
++    source: str = "Alpha Vantage"
++    note: str = "End-of-day prices, not live quotes. Indicators are calculated here from these closes."
++
++
++class MarketStatus(BaseModel):
++    configured: bool
++    budget_used: int
++    budget_limit: int
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p5/backend/app/core/config.py xvortex/backend/app/core/config.py
+--- a/backend/app/core/config.py	2026-11-26 22:44:40.000000000 +0100
++++ b/backend/app/core/config.py	2026-11-26 23:46:52.278711192 +0100
+@@ -21,6 +21,12 @@
+     # Password hashing uses ~64 MiB per call; this caps how many run at once so a burst of logins
+     # cannot exhaust a small instance's memory.
+     password_hash_concurrency: int = Field(default=2, ge=1, le=16)
++    # Market data (Alpha Vantage, end-of-day prices). Without a key the Market page works for watchlists
++    # only and says prices are unavailable. The free plan allows 25 requests a day; the limit below is
++    # what this app will spend, leaving headroom for requests made outside it.
++    alphavantage_api_key: str | None = None
++    alphavantage_daily_limit: int = Field(default=20, ge=1, le=25)
++    market_cache_hours: int = Field(default=12, ge=1, le=72)
+     # Optional first-run bootstrap: creates this admin only if the users table is empty.
+     admin_email: str | None = None
+     admin_password: str | None = None
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p5/backend/app/main.py xvortex/backend/app/main.py
+--- a/backend/app/main.py	2026-11-26 23:37:02.000000000 +0100
++++ b/backend/app/main.py	2026-11-26 23:47:22.608969233 +0100
+@@ -6,7 +6,7 @@
+ from sqlalchemy import text
+ from sqlalchemy.orm import Session
+ 
+-from app.api import admin, auth, borrowers, dashboard, loans, notifications, settings as settings_api
++from app.api import admin, auth, borrowers, dashboard, loans, market, notifications, settings as settings_api
+ from app.core.config import get_settings
+ from app.core.logging import configure_logging
+ from app.db import SessionLocal, get_db
+@@ -61,6 +61,7 @@
+ app.include_router(dashboard.router)
+ app.include_router(borrowers.router)
+ app.include_router(loans.router)
++app.include_router(market.router)
+ app.include_router(settings_api.router)
+ app.include_router(notifications.router)
+ 
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p5/backend/app/services/dashboard.py xvortex/backend/app/services/dashboard.py
+--- a/backend/app/services/dashboard.py	2026-11-26 22:46:11.000000000 +0100
++++ b/backend/app/services/dashboard.py	2026-11-26 23:47:43.486547427 +0100
+@@ -8,6 +8,7 @@
+ from sqlalchemy import func, select
+ from sqlalchemy.orm import Session
+ 
++from app.core.config import get_settings
+ from app.models import (
+     Borrower, Loan, LoanPayment, LoanRepaymentSchedule, Notification, PaperAccount, PaperPosition,
+     PaperTrade, User, UserSettings, Watchlist, WatchlistInstrument,
+@@ -144,7 +145,7 @@
+         ],
+         "paper": _paper(db, user.id, currency),
+         "watchlists": _watchlists(db, user.id),
+-        "market_data_status": "unavailable",
++        "market_data_status": "end_of_day" if get_settings().alphavantage_api_key else "unavailable",
+         "transactions": _transactions(db, user.id, currency),
+         "news": {"status": "unavailable", "items": []},
+         "notifications": {"unread": unread_count(db, user.id), "latest": notification_items(db, user.id, 5)},
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p5/backend/app/services/market/indicators.py xvortex/backend/app/services/market/indicators.py
+--- a/backend/app/services/market/indicators.py	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/app/services/market/indicators.py	2026-11-26 23:46:20.356271854 +0100
+@@ -0,0 +1,49 @@
++"""Technical indicators over closing prices. Exact Decimal arithmetic; None where there is not enough history."""
++from decimal import ROUND_HALF_UP, Decimal
++
++Q = Decimal("0.0001")
++
++
++def _q(x: Decimal) -> Decimal:
++    return x.quantize(Q, rounding=ROUND_HALF_UP)
++
++
++def sma(closes: list[Decimal], period: int) -> list[Decimal | None]:
++    """Simple moving average; the first period-1 entries are None."""
++    if period < 1:
++        raise ValueError("period must be at least 1")
++    out: list[Decimal | None] = []
++    window = Decimal(0)
++    for i, c in enumerate(closes):
++        window += c
++        if i >= period:
++            window -= closes[i - period]
++        out.append(_q(window / period) if i >= period - 1 else None)
++    return out
++
++
++def rsi(closes: list[Decimal], period: int = 14) -> list[Decimal | None]:
++    """Wilder's RSI on a 0-100 scale. The first value needs period+1 closes. A flat series is 50."""
++    if period < 1:
++        raise ValueError("period must be at least 1")
++    out: list[Decimal | None] = [None] * len(closes)
++    if len(closes) <= period:
++        return out
++    gains = [max(closes[i] - closes[i - 1], Decimal(0)) for i in range(1, len(closes))]
++    losses = [max(closes[i - 1] - closes[i], Decimal(0)) for i in range(1, len(closes))]
++    avg_gain = sum(gains[:period], Decimal(0)) / period
++    avg_loss = sum(losses[:period], Decimal(0)) / period
++
++    def value() -> Decimal:
++        if avg_gain == 0 and avg_loss == 0:
++            return Decimal(50)
++        if avg_loss == 0:
++            return Decimal(100)
++        return _q(100 - 100 / (1 + avg_gain / avg_loss))
++
++    out[period] = value()
++    for i in range(period, len(gains)):
++        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
++        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
++        out[i + 1] = value()
++    return out
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p5/backend/app/services/market/provider.py xvortex/backend/app/services/market/provider.py
+--- a/backend/app/services/market/provider.py	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/app/services/market/provider.py	2026-11-26 23:46:20.353288575 +0100
+@@ -0,0 +1,77 @@
++"""Alpha Vantage daily prices. Parsing is pure (tested without network); the fetch uses only the stdlib.
++
++Free keys allow 25 requests a day and 5 a minute and return the latest 100 daily bars, so callers
++cache aggressively and count every request (see service.py). Prices are end-of-day, never live.
++"""
++import json
++import urllib.error
++import urllib.parse
++import urllib.request
++from dataclasses import dataclass
++from datetime import date
++from decimal import Decimal, InvalidOperation
++
++URL = "https://www.alphavantage.co/query"
++SYMBOL_PATTERN = r"^[A-Z0-9][A-Z0-9.\-]{0,15}$"
++
++
++class ProviderError(Exception):
++    """kind: rate_limit | invalid_symbol | auth | unavailable"""
++
++    def __init__(self, kind: str, message: str):
++        super().__init__(message)
++        self.kind = kind
++
++
++@dataclass(frozen=True)
++class Bar:
++    day: date
++    open: Decimal
++    high: Decimal
++    low: Decimal
++    close: Decimal
++    volume: int
++
++
++def parse_daily(payload: dict) -> list[Bar]:
++    """Oldest first. Raises ProviderError for the provider's error and limit messages."""
++    if not isinstance(payload, dict):
++        raise ProviderError("unavailable", "Unexpected response from the price provider.")
++    message = payload.get("Error Message")
++    if message:
++        text = str(message).lower()
++        if "apikey" in text or "api key" in text:
++            raise ProviderError("auth", "The price provider rejected the API key.")
++        raise ProviderError("invalid_symbol", "The price provider does not know this symbol.")
++    note = payload.get("Note") or payload.get("Information")
++    if note:
++        text = str(note).lower()
++        if any(w in text for w in ("per day", "per minute", "call frequency", "rate limit", "requests")):
++            raise ProviderError("rate_limit", "The price provider's request limit has been reached.")
++        if "api key" in text or "apikey" in text:
++            raise ProviderError("auth", "The price provider rejected the API key.")
++        raise ProviderError("unavailable", "The price provider could not serve this request.")
++    series = payload.get("Time Series (Daily)")
++    if not isinstance(series, dict) or not series:
++        raise ProviderError("unavailable", "The price provider returned no daily prices.")
++    bars = []
++    try:
++        for day, row in series.items():
++            bars.append(Bar(
++                date.fromisoformat(day), Decimal(row["1. open"]), Decimal(row["2. high"]),
++                Decimal(row["3. low"]), Decimal(row["4. close"]), int(row["5. volume"]),
++            ))
++    except (KeyError, ValueError, InvalidOperation, TypeError):
++        raise ProviderError("unavailable", "The price provider returned malformed prices.")
++    bars.sort(key=lambda b: b.day)
++    return bars
++
++
++def fetch_daily(symbol: str, api_key: str, timeout: float = 10.0) -> list[Bar]:
++    query = urllib.parse.urlencode({"function": "TIME_SERIES_DAILY", "symbol": symbol, "outputsize": "compact", "apikey": api_key})
++    try:
++        with urllib.request.urlopen(f"{URL}?{query}", timeout=timeout) as resp:  # noqa: S310 (fixed https URL)
++            payload = json.loads(resp.read(2_000_000))
++    except (urllib.error.URLError, TimeoutError, ValueError, OSError):
++        raise ProviderError("unavailable", "Could not reach the price provider.")
++    return parse_daily(payload)
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p5/backend/app/services/market/service.py xvortex/backend/app/services/market/service.py
+--- a/backend/app/services/market/service.py	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/app/services/market/service.py	2026-11-26 23:46:52.281290473 +0100
+@@ -0,0 +1,132 @@
++"""Cached daily prices with a hard daily request budget.
++
++Prices are shared public data, so the cache is shared across users. Every provider request is counted
++before it is made (failed requests count too: the provider counts them). When the provider fails or the
++budget is used up, the last cached prices are returned marked stale rather than hidden or invented.
++"""
++from dataclasses import dataclass
++from datetime import date, datetime, timedelta, timezone
++from decimal import Decimal
++
++from sqlalchemy import select
++from sqlalchemy.exc import IntegrityError
++from sqlalchemy.orm import Session
++
++from app.core.config import Settings
++from app.models import MarketDataCache
++
++from .provider import Bar, ProviderError, fetch_daily
++
++PROVIDER = "alphavantage"
++MIN_REFRESH = timedelta(minutes=15)  # a manual refresh cannot spend requests faster than this per symbol
++
++
++class MarketUnavailable(Exception):
++    """kind: not_configured | budget | rate_limit | invalid_symbol | auth | unavailable"""
++
++    def __init__(self, kind: str, message: str):
++        super().__init__(message)
++        self.kind = kind
++
++
++@dataclass
++class Daily:
++    bars: list[Bar]
++    fetched_at: datetime
++    expires_at: datetime
++    stale: bool
++    warning: str | None
++
++
++def _utc(dt: datetime) -> datetime:
++    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
++
++
++def cache_key(symbol: str) -> str:
++    return f"av:daily:{symbol}"
++
++
++def encode_bars(bars: list[Bar]) -> dict:
++    return {"bars": [[b.day.isoformat(), str(b.open), str(b.high), str(b.low), str(b.close), b.volume] for b in bars]}
++
++
++def decode_bars(payload: dict) -> list[Bar]:
++    return [Bar(date.fromisoformat(d), Decimal(o), Decimal(h), Decimal(l), Decimal(c), int(v)) for d, o, h, l, c, v in payload["bars"]]
++
++
++def _budget_key(day: date) -> str:
++    return f"av:budget:{day.isoformat()}"
++
++
++def budget_used(db: Session, now: datetime) -> int:
++    row = db.scalar(select(MarketDataCache).where(MarketDataCache.cache_key == _budget_key(now.date())))
++    return int(row.payload.get("used", 0)) if row else 0
++
++
++def _reserve_request(db: Session, now: datetime, limit: int) -> bool:
++    """Counts one provider request against today's budget (UTC day). False when the budget is used up."""
++    key = _budget_key(now.date())
++    for attempt in (1, 2):
++        row = db.scalar(select(MarketDataCache).where(MarketDataCache.cache_key == key).with_for_update())
++        if row is not None:
++            used = int(row.payload.get("used", 0))
++            if used >= limit:
++                db.rollback()
++                return False
++            row.payload = {"used": used + 1}
++            db.commit()
++            return True
++        try:
++            db.add(MarketDataCache(
++                cache_key=key, provider=PROVIDER, symbol="*", data_type="budget", payload={"used": 1},
++                fetched_at=now, expires_at=now + timedelta(days=2),
++            ))
++            db.commit()
++            return True
++        except IntegrityError:  # another request created today's row first; count on top of it
++            db.rollback()
++    return False
++
++
++def cached_daily(db: Session, symbol: str) -> MarketDataCache | None:
++    return db.scalar(select(MarketDataCache).where(MarketDataCache.cache_key == cache_key(symbol)))
++
++
++def get_daily(db: Session, settings: Settings, symbol: str, now: datetime | None = None, force: bool = False) -> Daily:
++    now = now or datetime.now(timezone.utc)
++    row = cached_daily(db, symbol)
++    if row is not None:
++        fresh = _utc(row.expires_at) > now
++        recent = now - _utc(row.fetched_at) < MIN_REFRESH
++        if (fresh and not force) or (force and recent):
++            return Daily(decode_bars(row.payload), _utc(row.fetched_at), _utc(row.expires_at), False, None)
++
++    def fall_back(kind: str, message: str) -> Daily:
++        if row is None:
++            raise MarketUnavailable(kind, message)
++        return Daily(decode_bars(row.payload), _utc(row.fetched_at), _utc(row.expires_at), True,
++                     f"{message} Showing the last prices saved.")
++
++    if not settings.alphavantage_api_key:
++        return fall_back("not_configured", "No price provider key is configured.")
++    if not _reserve_request(db, now, settings.alphavantage_daily_limit):
++        return fall_back("budget", "Today's price request budget is used up.")
++    try:
++        bars = fetch_daily(symbol, settings.alphavantage_api_key)
++    except ProviderError as exc:
++        return fall_back(exc.kind, str(exc))
++    expires = now + timedelta(hours=settings.market_cache_hours)
++    payload = encode_bars(bars)
++    row = cached_daily(db, symbol)  # re-read: the budget commit above may have expired it
++    if row is None:
++        db.add(MarketDataCache(
++            cache_key=cache_key(symbol), provider=PROVIDER, symbol=symbol, data_type="daily",
++            payload=payload, fetched_at=now, expires_at=expires,
++        ))
++    else:
++        row.payload, row.fetched_at, row.expires_at = payload, now, expires
++    try:
++        db.commit()
++    except IntegrityError:  # two requests for a new symbol raced; the other one's data is just as good
++        db.rollback()
++    return Daily(bars, now, expires, False, None)
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p5/backend/tests/test_market_api.py xvortex/backend/tests/test_market_api.py
+--- a/backend/tests/test_market_api.py	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/tests/test_market_api.py	2026-11-26 23:47:43.510858379 +0100
+@@ -0,0 +1,105 @@
++"""Watchlist and daily-price endpoints (needs the full dependency set)."""
++from datetime import date, timedelta
++from decimal import Decimal as D
++
++import pytest
++
++pytest.importorskip("fastapi")
++pytest.importorskip("argon2")
++
++from app.core.config import get_settings  # noqa: E402
++from app.services.market import service  # noqa: E402
++from app.services.market.provider import Bar, ProviderError  # noqa: E402
++from tests.helpers import login_csrf  # noqa: E402
++
++
++def _bars(n=60):
++    start = date(2026, 1, 1)
++    return [Bar(start + timedelta(days=i), D(100 + i), D(100 + i), D(100 + i), D(100 + i), 10) for i in range(n)]
++
++
++@pytest.fixture()
++def provider(monkeypatch):
++    settings = get_settings()
++    monkeypatch.setattr(settings, "alphavantage_api_key", "test-key", raising=False)
++    calls = []
++
++    def fake(symbol, key):
++        calls.append(symbol)
++        if isinstance(fake.result, Exception):
++            raise fake.result
++        return fake.result
++    fake.result, fake.calls = _bars(), calls
++    monkeypatch.setattr(service, "fetch_daily", fake)
++    return fake
++
++
++def _list(client, h, name="Core"):
++    r = client.post("/api/market/watchlists", json={"name": name}, headers=h)
++    assert r.status_code == 201, r.text
++    return r.json()["id"]
++
++
++def test_needs_sign_in(client):
++    assert client.get("/api/market/watchlists").status_code == 401
++    assert client.get("/api/market/symbols/IBM/daily").status_code == 401
++
++
++def test_watchlist_crud_and_validation(client):
++    h = login_csrf(client)
++    wid = _list(client, h)
++    assert client.post("/api/market/watchlists", json={"name": "Core"}, headers=h).status_code == 409
++    assert client.post("/api/market/watchlists", json={"name": "  "}, headers=h).status_code == 422
++    r = client.post(f"/api/market/watchlists/{wid}/instruments", json={"symbol": " ibm "}, headers=h)
++    assert r.status_code == 201 and r.json()["instruments"][0]["symbol"] == "IBM"
++    assert r.json()["instruments"][0]["last_close"] is None  # nothing fetched yet
++    assert client.post(f"/api/market/watchlists/{wid}/instruments", json={"symbol": "IBM"}, headers=h).status_code == 409
++    assert client.post(f"/api/market/watchlists/{wid}/instruments", json={"symbol": "bad symbol!"}, headers=h).status_code == 422
++    assert client.patch(f"/api/market/watchlists/{wid}", json={"name": "Renamed"}, headers=h).json()["name"] == "Renamed"
++    assert client.delete(f"/api/market/watchlists/{wid}/instruments/IBM", headers=h).json()["instruments"] == []
++    assert client.delete(f"/api/market/watchlists/{wid}/instruments/IBM", headers=h).status_code == 404
++    assert client.delete(f"/api/market/watchlists/{wid}", headers=h).status_code == 204
++    assert client.get("/api/market/watchlists").json() == []
++
++
++def test_daily_returns_prices_indicators_and_freshness(client, provider):
++    h = login_csrf(client)
++    wid = _list(client, h)
++    client.post(f"/api/market/watchlists/{wid}/instruments", json={"symbol": "IBM"}, headers=h)
++    d = client.get("/api/market/symbols/IBM/daily").json()
++    assert len(d["bars"]) == 60 and d["stale"] is False and d["source"] == "Alpha Vantage"
++    assert d["sma20"][18] is None and d["sma20"][19] is not None and d["sma50"][48] is None and d["rsi14"][13] is None
++    assert D(d["rsi14"][-1]) == D(100)  # prices only rise
++    client.get("/api/market/symbols/IBM/daily")
++    assert provider.calls == ["IBM"]  # second view came from the saved prices
++    row = client.get("/api/market/watchlists").json()[0]["instruments"][0]
++    assert row["last_close"] == "159.000000" or D(row["last_close"]) == D(159)
++    assert row["as_of"] == (date(2026, 1, 1) + timedelta(days=59)).isoformat() and row["change_pct"] is not None
++
++
++def test_daily_only_for_symbols_on_your_watchlists(client, provider):
++    h = login_csrf(client)
++    assert client.get("/api/market/symbols/IBM/daily").status_code == 404
++    wid = _list(client, h)
++    client.post(f"/api/market/watchlists/{wid}/instruments", json={"symbol": "IBM"}, headers=h)
++    other = login_csrf(client, "user@example.com")  # noqa: F841
++    assert client.get("/api/market/symbols/IBM/daily").status_code == 404
++    assert client.get("/api/market/watchlists").json() == []
++    assert provider.calls == []
++
++
++def test_provider_problems_map_to_clear_statuses(client, provider):
++    h = login_csrf(client)
++    wid = _list(client, h)
++    client.post(f"/api/market/watchlists/{wid}/instruments", json={"symbol": "ZZZ"}, headers=h)
++    provider.result = ProviderError("invalid_symbol", "The price provider does not know this symbol.")
++    assert client.get("/api/market/symbols/ZZZ/daily").status_code == 404
++    provider.result = ProviderError("rate_limit", "The price provider's request limit has been reached.")
++    r = client.get("/api/market/symbols/ZZZ/daily")
++    assert r.status_code == 429 and "limit" in r.json()["detail"]
++
++
++def test_status_reports_budget(client, provider):
++    login_csrf(client)
++    s = client.get("/api/market/status").json()
++    assert s["configured"] is True and s["budget_used"] == 0 and s["budget_limit"] >= 1
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p5/backend/tests/test_market_logic.py xvortex/backend/tests/test_market_logic.py
+--- a/backend/tests/test_market_logic.py	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/tests/test_market_logic.py	2026-11-26 23:46:20.357293069 +0100
+@@ -0,0 +1,59 @@
++from datetime import date
++from decimal import Decimal as D
++
++import pytest
++
++from app.services.market.indicators import rsi, sma
++from app.services.market.provider import ProviderError, parse_daily
++
++
++def _row(c):
++    return {"1. open": c, "2. high": c, "3. low": c, "4. close": c, "5. volume": "100"}
++
++
++def test_parse_orders_oldest_first_and_keeps_decimals():
++    bars = parse_daily({"Meta Data": {}, "Time Series (Daily)": {"2026-01-03": _row("3.10"), "2026-01-02": _row("2.05")}})
++    assert [b.day for b in bars] == [date(2026, 1, 2), date(2026, 1, 3)]
++    assert bars[0].close == D("2.05") and bars[1].volume == 100
++
++
++@pytest.mark.parametrize("payload,kind", [
++    ({"Error Message": "Invalid API call. Please retry or visit the documentation"}, "invalid_symbol"),
++    ({"Error Message": "the parameter apikey is invalid or missing."}, "auth"),
++    ({"Information": "our standard API rate limit is 25 requests per day."}, "rate_limit"),
++    ({"Note": "Thank you! Our standard API call frequency is 5 calls per minute"}, "rate_limit"),
++    ({"Information": "The demo API key is for demo purposes only."}, "auth"),
++    ({"Information": "Something else entirely"}, "unavailable"),
++    ({}, "unavailable"), ({"Time Series (Daily)": {"2026-01-02": {"1. open": "x"}}}, "unavailable"),
++    ({"Time Series (Daily)": {"bad-date": _row("1")}}, "unavailable"), ([], "unavailable"),
++])
++def test_provider_errors_are_classified(payload, kind):
++    with pytest.raises(ProviderError) as e:
++        parse_daily(payload)
++    assert e.value.kind == kind
++
++
++def test_sma():
++    out = sma([D(x) for x in (1, 2, 3, 4, 5)], 3)
++    assert out == [None, None, D("2.0000"), D("3.0000"), D("4.0000")]
++    assert sma([D(1)], 1) == [D("1.0000")]
++    with pytest.raises(ValueError):
++        sma([D(1)], 0)
++
++
++def test_rsi_edges():
++    assert rsi([D(1)] * 5, 14) == [None] * 5  # too short
++    assert rsi([D(5)] * 20, 14)[-1] == D(50)  # flat
++    assert rsi([D(i) for i in range(1, 21)], 14)[-1] == D(100)  # only gains
++    assert rsi([D(20 - i) for i in range(20)], 14)[-1] == D("0.0000")  # only losses
++    assert rsi([D(i) for i in range(1, 21)], 14)[:14] == [None] * 14
++
++
++def test_rsi_matches_wilder_reference():
++    # Classic worked example (Wilder / StockCharts): first RSI(14) value is about 70.46.
++    closes = [D(x) for x in (
++        "44.3389", "44.0902", "44.1497", "43.6124", "44.3278", "44.8264", "45.0955", "45.4245", "45.8433",
++        "46.0826", "45.8931", "46.0328", "45.6140", "46.2820", "46.2820",
++    )]
++    first = rsi(closes, 14)[14]
++    assert D("70.0") < first < D("71.0")
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p5/backend/tests/test_market_service.py xvortex/backend/tests/test_market_service.py
+--- a/backend/tests/test_market_service.py	1970-01-01 01:00:00.000000000 +0100
++++ b/backend/tests/test_market_service.py	2026-11-26 23:46:52.284967823 +0100
+@@ -0,0 +1,103 @@
++"""Cache and budget rules, run against in-memory SQLite (needs sqlalchemy)."""
++from datetime import datetime, timedelta, timezone
++from decimal import Decimal as D
++
++import pytest
++
++pytest.importorskip("sqlalchemy")
++pytest.importorskip("pydantic_settings")
++
++from sqlalchemy import create_engine  # noqa: E402
++from sqlalchemy.orm import sessionmaker  # noqa: E402
++from sqlalchemy.pool import StaticPool  # noqa: E402
++
++from app.models import Base  # noqa: E402
++from app.services.market import service  # noqa: E402
++from app.services.market.provider import Bar, ProviderError  # noqa: E402
++
++NOW = datetime(2026, 3, 2, 12, 0, tzinfo=timezone.utc)
++
++
++class Cfg:
++    def __init__(self, key="k", limit=2, hours=12):
++        self.alphavantage_api_key, self.alphavantage_daily_limit, self.market_cache_hours = key, limit, hours
++
++
++def _bars(close="10"):
++    from datetime import date
++    return [Bar(date(2026, 2, 27), D(close), D(close), D(close), D(close), 1)]
++
++
++@pytest.fixture()
++def db():
++    engine = create_engine("sqlite+pysqlite://", poolclass=StaticPool, connect_args={"check_same_thread": False})
++    Base.metadata.create_all(engine)
++    with sessionmaker(bind=engine, expire_on_commit=False)() as s:
++        yield s
++
++
++@pytest.fixture()
++def fetches(monkeypatch):
++    calls = []
++
++    def fake(symbol, key):
++        calls.append(symbol)
++        if isinstance(fake.result, Exception):
++            raise fake.result
++        return fake.result
++    fake.result = _bars()
++    monkeypatch.setattr(service, "fetch_daily", fake)
++    fake.calls = calls
++    return fake
++
++
++def test_fresh_cache_is_served_without_a_request(db, fetches):
++    first = service.get_daily(db, Cfg(), "IBM", NOW)
++    again = service.get_daily(db, Cfg(), "IBM", NOW + timedelta(hours=1))
++    assert len(fetches.calls) == 1 and not again.stale and again.bars == first.bars
++    assert service.budget_used(db, NOW) == 1
++
++
++def test_expired_cache_is_refetched(db, fetches):
++    service.get_daily(db, Cfg(), "IBM", NOW)
++    fetches.result = _bars("11")
++    later = service.get_daily(db, Cfg(), "IBM", NOW + timedelta(hours=13))
++    assert len(fetches.calls) == 2 and later.bars[-1].close == D("11")
++
++
++def test_manual_refresh_is_rate_limited_per_symbol(db, fetches):
++    service.get_daily(db, Cfg(), "IBM", NOW)
++    service.get_daily(db, Cfg(), "IBM", NOW + timedelta(minutes=5), force=True)
++    assert len(fetches.calls) == 1
++    service.get_daily(db, Cfg(), "IBM", NOW + timedelta(minutes=20), force=True)
++    assert len(fetches.calls) == 2
++
++
++def test_budget_stops_requests_and_serves_stale_data(db, fetches):
++    cfg = Cfg(limit=2)
++    service.get_daily(db, cfg, "AAA", NOW)
++    service.get_daily(db, cfg, "BBB", NOW)
++    with pytest.raises(service.MarketUnavailable) as e:
++        service.get_daily(db, cfg, "CCC", NOW)  # nothing cached, budget gone
++    assert e.value.kind == "budget" and len(fetches.calls) == 2
++    stale = service.get_daily(db, cfg, "AAA", NOW + timedelta(hours=13))  # expired but budget gone
++    assert stale.stale and "budget" in stale.warning and len(fetches.calls) == 2
++    # a new UTC day has a new budget
++    service.get_daily(db, cfg, "CCC", NOW + timedelta(days=1))
++    assert len(fetches.calls) == 3
++
++
++def test_provider_failure_falls_back_to_cache_or_raises(db, fetches):
++    service.get_daily(db, Cfg(limit=5), "IBM", NOW)
++    fetches.result = ProviderError("rate_limit", "The price provider's request limit has been reached.")
++    stale = service.get_daily(db, Cfg(limit=5), "IBM", NOW + timedelta(hours=13))
++    assert stale.stale and "limit" in stale.warning
++    with pytest.raises(service.MarketUnavailable) as e:
++        service.get_daily(db, Cfg(limit=5), "NEW", NOW)
++    assert e.value.kind == "rate_limit"
++
++
++def test_without_a_key_nothing_is_fetched(db, fetches):
++    with pytest.raises(service.MarketUnavailable) as e:
++        service.get_daily(db, Cfg(key=None), "IBM", NOW)
++    assert e.value.kind == "not_configured" and fetches.calls == []
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p5/frontend/src/App.tsx xvortex/frontend/src/App.tsx
+--- a/frontend/src/App.tsx	2026-11-26 23:39:06.000000000 +0100
++++ b/frontend/src/App.tsx	2026-11-26 23:48:48.854961286 +0100
+@@ -9,6 +9,7 @@
+ import Borrowers from "./pages/Borrowers";
+ import LoanDetail from "./pages/LoanDetail";
+ import Loans from "./pages/Loans";
++import Market from "./pages/Market";
+ import NewLoan from "./pages/NewLoan";
+ import ComingSoon from "./pages/ComingSoon";
+ import Login from "./pages/Login";
+@@ -46,7 +47,7 @@
+                 <Route path="loans/new" element={<NewLoan />} />
+                 <Route path="loans/borrowers" element={<Borrowers />} />
+                 <Route path="loans/:id" element={<LoanDetail />} />
+-                <Route path="market" element={<ComingSoon title="Market" phase={5}>Watchlists, charts and indicators will appear here, each with a clear data-freshness label.</ComingSoon>} />
++                <Route path="market" element={<Market />} />
+                 <Route path="paper" element={<ComingSoon title="Paper Trading" phase={6}>Simulated orders and positions will live here. No real orders are ever placed.</ComingSoon>} />
+                 <Route path="analytics" element={<ComingSoon title="Analytics" phase={7}>Loan, portfolio and cash-flow reports with CSV and PDF export will be here.</ComingSoon>} />
+                 <Route path="assistant" element={<ComingSoon title="Assistant" phase={8}>An optional assistant that explains your data. It only sees your data if you allow it.</ComingSoon>} />
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p5/frontend/src/components/market/PriceChart.tsx xvortex/frontend/src/components/market/PriceChart.tsx
+--- a/frontend/src/components/market/PriceChart.tsx	1970-01-01 01:00:00.000000000 +0100
++++ b/frontend/src/components/market/PriceChart.tsx	2026-11-26 23:48:48.829578025 +0100
+@@ -0,0 +1,145 @@
++import { useState, type PointerEvent } from "react";
++import { formatDate } from "../../lib/format";
++import type { DailyPrices } from "../../lib/types";
++
++const W = 720;
++const PAD = { l: 56, r: 12, t: 12, b: 22 };
++const num = (v: string | null): number | null => (v === null ? null : Number(v));
++
++interface Series { key: string; label: string; color: string; dash?: string; values: (number | null)[] }
++
++function path(values: (number | null)[], x: (i: number) => number, y: (v: number) => number): string {
++  let d = "";
++  let pen = false;
++  values.forEach((v, i) => {
++    if (v === null) { pen = false; return; }
++    d += `${pen ? "L" : "M"}${x(i).toFixed(1)} ${y(v).toFixed(1)}`;
++    pen = true;
++  });
++  return d;
++}
++
++function Panel({
++  height, series, hover, setHover, dates, guides, fixed, format,
++}: {
++  height: number; series: Series[]; hover: number | null; setHover: (i: number | null) => void; dates: string[];
++  guides?: number[]; fixed?: [number, number]; format: (v: number) => string;
++}) {
++  const n = dates.length;
++  const all = series.flatMap((s) => s.values).filter((v): v is number => v !== null);
++  let lo = fixed ? fixed[0] : Math.min(...all);
++  let hi = fixed ? fixed[1] : Math.max(...all);
++  if (lo === hi) { lo -= 1; hi += 1; }
++  const x = (i: number) => PAD.l + (n === 1 ? 0 : (i / (n - 1)) * (W - PAD.l - PAD.r));
++  const y = (v: number) => PAD.t + (1 - (v - lo) / (hi - lo)) * (height - PAD.t - PAD.b);
++  const ticks = [lo, lo + (hi - lo) / 2, hi];
++
++  function move(e: PointerEvent<SVGRectElement>) {
++    const box = e.currentTarget.getBoundingClientRect();
++    const px = ((e.clientX - box.left) / box.width) * (W - PAD.l - PAD.r);
++    setHover(Math.max(0, Math.min(n - 1, Math.round((px / (W - PAD.l - PAD.r)) * (n - 1)))));
++  }
++
++  return (
++    <svg viewBox={`0 0 ${W} ${height}`} className="w-full" role="img" aria-label={series.map((s) => s.label).join(", ")}>
++      {ticks.map((t) => (
++        <g key={t}>
++          <line x1={PAD.l} x2={W - PAD.r} y1={y(t)} y2={y(t)} stroke="rgb(var(--line) / 0.12)" />
++          <text x={PAD.l - 6} y={y(t) + 4} textAnchor="end" fontSize="11" fill="rgb(var(--dim))">{format(t)}</text>
++        </g>
++      ))}
++      {guides?.map((g) => (
++        <line key={g} x1={PAD.l} x2={W - PAD.r} y1={y(g)} y2={y(g)} stroke="rgb(var(--dim) / 0.5)" strokeDasharray="2 4" />
++      ))}
++      <text x={PAD.l} y={height - 6} fontSize="11" fill="rgb(var(--dim))">{formatDate(dates[0], "UTC")}</text>
++      <text x={W - PAD.r} y={height - 6} textAnchor="end" fontSize="11" fill="rgb(var(--dim))">{formatDate(dates[n - 1], "UTC")}</text>
++      {series.map((s) => (
++        <path key={s.key} d={path(s.values, x, y)} fill="none" stroke={s.color} strokeWidth={2} strokeDasharray={s.dash}
++          strokeLinecap="round" strokeLinejoin="round" />
++      ))}
++      {hover !== null && (
++        <g>
++          <line x1={x(hover)} x2={x(hover)} y1={PAD.t} y2={height - PAD.b} stroke="rgb(var(--dim) / 0.6)" />
++          {series.map((s) => s.values[hover] !== null && (
++            <circle key={s.key} cx={x(hover)} cy={y(s.values[hover] as number)} r={4} fill={s.color} stroke="rgb(var(--panel))" strokeWidth={2} />
++          ))}
++        </g>
++      )}
++      <rect x={PAD.l} y={PAD.t} width={W - PAD.l - PAD.r} height={height - PAD.t - PAD.b} fill="transparent"
++        onPointerMove={move} onPointerLeave={() => setHover(null)} />
++    </svg>
++  );
++}
++
++export function PriceChart({ data, currencyHint }: { data: DailyPrices; currencyHint?: string }) {
++  const [hover, setHover] = useState<number | null>(null);
++  const [asTable, setAsTable] = useState(false);
++  const dates = data.bars.map((b) => b.date);
++  const price: Series[] = [
++    { key: "close", label: "Close", color: "rgb(var(--chart-1))", values: data.bars.map((b) => Number(b.close)) },
++    { key: "sma20", label: "20-day average", color: "rgb(var(--chart-2))", dash: "6 4", values: data.sma20.map(num) },
++    { key: "sma50", label: "50-day average", color: "rgb(var(--chart-3))", dash: "2 4", values: data.sma50.map(num) },
++  ].filter((s) => s.values.some((v) => v !== null));
++  const rsi: Series[] = [{ key: "rsi", label: "RSI (14)", color: "rgb(var(--chart-1))", values: data.rsi14.map(num) }];
++  const i = hover ?? data.bars.length - 1;
++  const bar = data.bars[i];
++  const fmt = (v: number) => v.toFixed(2);
++
++  if (data.bars.length < 2) return <p className="text-sm text-dim">Not enough prices to draw a chart.</p>;
++
++  return (
++    <div>
++      <div className="flex flex-wrap items-center justify-between gap-2">
++        <ul className="flex flex-wrap gap-4 text-xs" aria-label="Legend">
++          {price.map((s) => (
++            <li key={s.key} className="flex items-center gap-1.5">
++              <svg width="26" height="8" aria-hidden><line x1="0" x2="26" y1="4" y2="4" stroke={s.color} strokeWidth="2" strokeDasharray={s.dash} /></svg>
++              {s.label}
++            </li>
++          ))}
++        </ul>
++        <button className="btn btn-ghost" onClick={() => setAsTable((t) => !t)}>{asTable ? "Show chart" : "Show as table"}</button>
++      </div>
++
++      <p className="num mt-2 text-sm" aria-live="off">
++        {formatDate(bar.date, "UTC")} · close {bar.close}{currencyHint ? ` ${currencyHint}` : ""}
++        {data.sma20[i] && ` · 20-day ${fmt(Number(data.sma20[i]))}`}
++        {data.sma50[i] && ` · 50-day ${fmt(Number(data.sma50[i]))}`}
++        {data.rsi14[i] && ` · RSI ${fmt(Number(data.rsi14[i]))}`}
++      </p>
++
++      {asTable ? (
++        <div className="mt-3 max-h-80 overflow-auto">
++          <table className="w-full text-left text-sm">
++            <thead className="sticky top-0 bg-panel text-xs uppercase tracking-wide text-dim">
++              <tr><th className="py-1 pr-3">Date</th><th className="pr-3 text-right">Open</th><th className="pr-3 text-right">High</th>
++                <th className="pr-3 text-right">Low</th><th className="pr-3 text-right">Close</th><th className="pr-3 text-right">20-day</th>
++                <th className="pr-3 text-right">50-day</th><th className="text-right">RSI</th></tr>
++            </thead>
++            <tbody>
++              {[...data.bars.keys()].reverse().map((k) => {
++                const b = data.bars[k];
++                return (
++                  <tr key={b.date} className="border-t border-line/15 num">
++                    <td className="py-1 pr-3">{b.date}</td><td className="pr-3 text-right">{b.open}</td><td className="pr-3 text-right">{b.high}</td>
++                    <td className="pr-3 text-right">{b.low}</td><td className="pr-3 text-right">{b.close}</td>
++                    <td className="pr-3 text-right">{data.sma20[k] ?? "—"}</td><td className="pr-3 text-right">{data.sma50[k] ?? "—"}</td>
++                    <td className="text-right">{data.rsi14[k] ?? "—"}</td>
++                  </tr>
++                );
++              })}
++            </tbody>
++          </table>
++        </div>
++      ) : (
++        <>
++          <div className="mt-2"><Panel height={260} series={price} hover={hover} setHover={setHover} dates={dates} format={fmt} /></div>
++          <p className="mt-3 text-xs text-dim">RSI (14): above 70 is often read as stretched upward, below 30 as stretched downward. It describes past moves only.</p>
++          <div className="mt-1">
++            <Panel height={110} series={rsi} hover={hover} setHover={setHover} dates={dates} guides={[30, 70]} fixed={[0, 100]} format={(v) => v.toFixed(0)} />
++          </div>
++        </>
++      )}
++    </div>
++  );
++}
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p5/frontend/src/components/widgets/MarketWidget.tsx xvortex/frontend/src/components/widgets/MarketWidget.tsx
+--- a/frontend/src/components/widgets/MarketWidget.tsx	2026-11-24 03:03:30.000000000 +0100
++++ b/frontend/src/components/widgets/MarketWidget.tsx	2026-11-26 23:47:43.486784460 +0100
+@@ -17,6 +17,9 @@
+           ))}
+         </ul>
+       )}
++      {data.market_data_status === "end_of_day" && data.watchlists.length > 0 && (
++        <p className="mt-4 text-xs text-dim">Prices are end-of-day. Open Market to see the latest saved close for each symbol.</p>
++      )}
+       {data.market_data_status === "unavailable" && (
+         <div className="mt-4">
+           <Unavailable>No price source is connected yet, so quotes and daily changes are not shown.</Unavailable>
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p5/frontend/src/index.css xvortex/frontend/src/index.css
+--- a/frontend/src/index.css	2026-11-24 02:53:02.000000000 +0100
++++ b/frontend/src/index.css	2026-11-26 23:48:23.229873103 +0100
+@@ -15,6 +15,9 @@
+   --line: 140 175 255;
+   --glow-a: 34 211 238;
+   --glow-b: 139 92 246;
++  --chart-1: 14 165 196;
++  --chart-2: 139 92 246;
++  --chart-3: 217 138 31;
+   color-scheme: dark;
+ }
+ :root[data-theme="light"] {
+@@ -29,6 +32,9 @@
+   --line: 40 70 140;
+   --glow-a: 56 189 248;
+   --glow-b: 167 139 250;
++  --chart-1: 8 133 168;
++  --chart-2: 109 40 217;
++  --chart-3: 180 83 9;
+   color-scheme: light;
+ }
+ 
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p5/frontend/src/lib/types.ts xvortex/frontend/src/lib/types.ts
+--- a/frontend/src/lib/types.ts	2026-11-26 23:38:11.000000000 +0100
++++ b/frontend/src/lib/types.ts	2026-11-26 23:48:23.229873103 +0100
+@@ -127,3 +127,29 @@
+   total_interest: string;
+   total_repayable: string;
+ }
++
++// ---- Market (phase 5). Prices are end-of-day. ----
++export interface Instrument {
++  symbol: string;
++  name: string | null;
++  last_close: string | null;
++  change_pct: string | null;
++  as_of: string | null;
++  fetched_at: string | null;
++}
++export interface Watchlist { id: string; name: string; instruments: Instrument[] }
++export interface MarketStatus { configured: boolean; budget_used: number; budget_limit: number }
++export interface DailyBar { date: string; open: string; high: string; low: string; close: string; volume: number }
++export interface DailyPrices {
++  symbol: string;
++  bars: DailyBar[];
++  sma20: (string | null)[];
++  sma50: (string | null)[];
++  rsi14: (string | null)[];
++  fetched_at: string;
++  expires_at: string;
++  stale: boolean;
++  warning: string | null;
++  source: string;
++  note: string;
++}
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p5/frontend/src/pages/Market.tsx xvortex/frontend/src/pages/Market.tsx
+--- a/frontend/src/pages/Market.tsx	1970-01-01 01:00:00.000000000 +0100
++++ b/frontend/src/pages/Market.tsx	2026-11-26 23:48:48.834419181 +0100
+@@ -0,0 +1,175 @@
++import { useCallback, useEffect, useState, type FormEvent } from "react";
++import { Loader2, RefreshCw, Trash2 } from "lucide-react";
++import { PriceChart } from "../components/market/PriceChart";
++import { Field } from "../components/ui/Field";
++import { api, ApiError } from "../lib/api";
++import { formatDate, formatDateTime } from "../lib/format";
++import type { DailyPrices, MarketStatus, Watchlist } from "../lib/types";
++import { useApi } from "../lib/useApi";
++
++const message = (e: unknown) => (e instanceof ApiError ? e.message : "Something went wrong. Try again.");
++
++function Change({ pct }: { pct: string | null }) {
++  if (pct === null) return <span className="text-dim">—</span>;
++  const n = Number(pct);
++  // The sign and the arrow carry the direction, not only the colour.
++  return <span className={`num ${n < 0 ? "text-danger" : n > 0 ? "text-cyan" : "text-dim"}`}>{n > 0 ? "▲ +" : n < 0 ? "▼ " : ""}{pct}%</span>;
++}
++
++function Prices({ symbol, onSettled }: { symbol: string; onSettled: () => void }) {
++  const [data, setData] = useState<DailyPrices | null>(null);
++  const [error, setError] = useState<string | null>(null);
++  const [busy, setBusy] = useState(false);
++
++  const load = useCallback(async (refresh: boolean) => {
++    setBusy(true);
++    setError(null);
++    try {
++      setData(await api<DailyPrices>(`/api/market/symbols/${encodeURIComponent(symbol)}/daily${refresh ? "?refresh=true" : ""}`));
++      onSettled();
++    } catch (err) {
++      setError(message(err));
++    } finally {
++      setBusy(false);
++    }
++  }, [symbol, onSettled]);
++
++  useEffect(() => { setData(null); void load(false); }, [load]);
++
++  return (
++    <div className="glass mt-6 rounded-2xl p-6">
++      <div className="flex flex-wrap items-center justify-between gap-3">
++        <h2 className="text-lg font-semibold">{symbol}</h2>
++        <button className="btn btn-ghost" disabled={busy} onClick={() => void load(true)}>
++          {busy ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <RefreshCw className="h-4 w-4" aria-hidden />}Refresh prices
++        </button>
++      </div>
++      {error && <p role="alert" className="mt-3 text-sm text-danger">{error}</p>}
++      {busy && !data && <p className="mt-3 text-sm text-dim" role="status">Loading prices…</p>}
++      {data && (
++        <>
++          <p className="mt-2 text-xs text-dim">
++            {data.source} · latest close {formatDate(data.bars[data.bars.length - 1].date, "UTC")} · saved {formatDateTime(data.fetched_at)}
++            {data.stale ? " · out of date" : ""}
++          </p>
++          {data.warning && <p role="status" className="mt-2 text-sm text-amber-500">{data.warning}</p>}
++          <div className="mt-4"><PriceChart data={data} /></div>
++          <p className="mt-3 text-xs text-dim">{data.note}</p>
++        </>
++      )}
++    </div>
++  );
++}
++
++export default function Market() {
++  const { data: lists, error, loading, reload } = useApi<Watchlist[]>("/api/market/watchlists");
++  const { data: status, reload: reloadStatus } = useApi<MarketStatus>("/api/market/status");
++  const [selected, setSelected] = useState<string | null>(null);
++  const [newName, setNewName] = useState("");
++  const [symbolInputs, setSymbolInputs] = useState<Record<string, string>>({});
++  const [actionError, setActionError] = useState<string | null>(null);
++  const [busy, setBusy] = useState(false);
++
++  async function act(fn: () => Promise<unknown>): Promise<boolean> {
++    setBusy(true);
++    setActionError(null);
++    try { await fn(); reload(); return true; } catch (err) { setActionError(message(err)); return false; } finally { setBusy(false); }
++  }
++
++  async function createList(e: FormEvent) {
++    e.preventDefault();
++    if (await act(() => api("/api/market/watchlists", { method: "POST", body: { name: newName } }))) setNewName("");
++  }
++
++  async function addSymbol(e: FormEvent, id: string) {
++    e.preventDefault();
++    const symbol = (symbolInputs[id] ?? "").trim();
++    if (await act(() => api(`/api/market/watchlists/${id}/instruments`, { method: "POST", body: { symbol } }))) {
++      setSymbolInputs((s) => ({ ...s, [id]: "" }));
++    }
++  }
++
++  const onSettled = useCallback(() => { reload(); reloadStatus(); }, [reload, reloadStatus]);
++
++  return (
++    <section>
++      <h1 className="text-2xl font-semibold">Market</h1>
++      <p className="mt-1 text-sm text-dim">
++        {status?.configured
++          ? `End-of-day prices from Alpha Vantage, saved and reused for hours. Price requests today: ${status.budget_used} of ${status.budget_limit}.`
++          : "No price provider key is configured, so watchlists work but prices are unavailable. Nothing is estimated."}
++      </p>
++
++      <form onSubmit={(e) => void createList(e)} className="glass mt-6 flex flex-wrap items-end gap-3 rounded-2xl p-5">
++        <Field className="min-w-60 flex-1" label="New watchlist" required maxLength={100} value={newName} onChange={(e) => setNewName(e.target.value)} />
++        <button className="btn btn-primary" disabled={busy || !newName.trim()}>Create</button>
++      </form>
++
++      {error && <p role="alert" className="mt-4 text-sm text-danger">{error}</p>}
++      {actionError && <p role="alert" className="mt-4 text-sm text-danger">{actionError}</p>}
++      {loading && !lists && <p className="mt-4 text-sm text-dim" role="status">Loading…</p>}
++      {lists && lists.length === 0 && <p className="mt-4 text-sm text-dim">No watchlists yet.</p>}
++
++      {lists?.map((w) => (
++        <div key={w.id} className="glass mt-6 rounded-2xl p-5">
++          <div className="flex flex-wrap items-center justify-between gap-3">
++            <h2 className="font-semibold">{w.name}</h2>
++            <div className="flex gap-2">
++              <button className="btn btn-ghost" disabled={busy} onClick={() => {
++                const name = window.prompt("Rename watchlist", w.name);
++                if (name && name.trim() && name !== w.name) void act(() => api(`/api/market/watchlists/${w.id}`, { method: "PATCH", body: { name } }));
++              }}>Rename</button>
++              <button className="btn btn-ghost" disabled={busy} onClick={() => {
++                if (window.confirm(`Delete the watchlist "${w.name}"?`)) void act(async () => {
++                  await api(`/api/market/watchlists/${w.id}`, { method: "DELETE" });
++                  if (w.instruments.some((i) => i.symbol === selected)) setSelected(null);
++                });
++              }}>Delete</button>
++            </div>
++          </div>
++
++          {w.instruments.length > 0 && (
++            <div className="mt-3 overflow-x-auto">
++              <table className="w-full min-w-[30rem] text-left text-sm">
++                <thead className="text-xs uppercase tracking-wide text-dim">
++                  <tr><th className="py-2 pr-3 font-medium">Symbol</th><th className="py-2 pr-3 text-right font-medium">Last close</th>
++                    <th className="py-2 pr-3 text-right font-medium">Change</th><th className="py-2 pr-3 font-medium">As of</th><th /></tr>
++                </thead>
++                <tbody>
++                  {w.instruments.map((i) => (
++                    <tr key={i.symbol} className="border-t border-line/15">
++                      <td className="py-2 pr-3">
++                        <button className={`font-medium hover:underline ${selected === i.symbol ? "text-fg" : "text-cyan"}`}
++                          aria-pressed={selected === i.symbol} onClick={() => setSelected(i.symbol)}>{i.symbol}</button>
++                        {i.name && <div className="text-xs text-dim">{i.name}</div>}
++                      </td>
++                      <td className="py-2 pr-3 text-right num">{i.last_close ?? <span className="text-dim">not loaded</span>}</td>
++                      <td className="py-2 pr-3 text-right"><Change pct={i.change_pct} /></td>
++                      <td className="py-2 pr-3 text-dim">{i.as_of ? formatDate(i.as_of, "UTC") : "—"}</td>
++                      <td className="py-2 text-right">
++                        <button className="text-dim hover:text-danger" aria-label={`Remove ${i.symbol} from ${w.name}`} disabled={busy}
++                          onClick={() => void act(async () => {
++                            await api(`/api/market/watchlists/${w.id}/instruments/${encodeURIComponent(i.symbol)}`, { method: "DELETE" });
++                            if (selected === i.symbol) setSelected(null);
++                          })}><Trash2 className="h-4 w-4" aria-hidden /></button>
++                      </td>
++                    </tr>
++                  ))}
++                </tbody>
++              </table>
++            </div>
++          )}
++
++          <form onSubmit={(e) => void addSymbol(e, w.id)} className="mt-4 flex flex-wrap items-end gap-3">
++            <Field className="w-48" label="Add symbol" maxLength={16} placeholder="IBM" hint="As the provider spells it, for example VOLV-B.STO"
++              value={symbolInputs[w.id] ?? ""} onChange={(e) => setSymbolInputs((s) => ({ ...s, [w.id]: e.target.value.toUpperCase() }))} />
++            <button className="btn btn-ghost" disabled={busy || !(symbolInputs[w.id] ?? "").trim()}>Add</button>
++          </form>
++        </div>
++      ))}
++
++      {selected && <Prices key={selected} symbol={selected} onSettled={onSettled} />}
++      {lists && lists.length > 0 && !selected && <p className="mt-6 text-sm text-dim">Choose a symbol to load its daily prices and chart.</p>}
++    </section>
++  );
++}
+diff -ruN '--exclude=.git' '--exclude=__pycache__' '--exclude=node_modules' snap_before_p5/render.yaml xvortex/render.yaml
+--- a/render.yaml	2026-11-26 22:47:32.000000000 +0100
++++ b/render.yaml	2026-11-26 23:49:10.580828445 +0100
+@@ -23,6 +23,10 @@
+         value: "1"           # proxies that append to X-Forwarded-For; check the README after first deploy
+       - key: PASSWORD_HASH_CONCURRENCY
+         value: "2"           # password hashes allowed at once (about 64 MiB each; the instance has 512 MB)
++      - key: ALPHAVANTAGE_API_KEY
++        sync: false          # optional: free key from alphavantage.co; without it prices are unavailable
++      - key: ALPHAVANTAGE_DAILY_LIMIT
++        value: "20"          # free plan allows 25 a day; this app stops at 20
+       - key: ADMIN_EMAIL
+         sync: false          # first administrator (used only if no users exist yet)
+       - key: ADMIN_PASSWORD
